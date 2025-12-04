@@ -1,22 +1,23 @@
 services:
-  - type: web
-    name: spothero-facilities-minimal
-    runtime: python
-    region: oregon # or "frankfurt", etc.
-    plan: free # or "starter" / "standard"
+  - type: worker
+    name: spothero-facilities-minimal-worker
+    env: python
+    region: oregon
+    plan: free
     autoDeploy: true
 
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
 
+    # Workers do NOT get $PORT by default; provide a fallback.
+    # This keeps uvicorn happy so your FastAPI lifespan tasks (refresh_loop + sh_update_loop) run.
     startCommand: >
-      uvicorn main:app --host 0.0.0.0 --port $PORT --log-level info
+      uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level warning
 
     envVars:
-      # --- Microsoft Graph / SharePoint (put real values in the dashboard or here) ---
       - key: GRAPH_TENANT_ID
-        sync: false # set in dashboard (keeps secret out of repo)
+        sync: false
       - key: GRAPH_CLIENT_ID
         sync: false
       - key: GRAPH_CLIENT_SECRET
@@ -28,7 +29,6 @@ services:
       - key: SP_TOKEN_JSON_PATH
         value: Business Optimization/Automation/token/token.json
 
-      # --- App behavior & caching ---
       - key: TOKEN_REFRESH_HOURS
         value: "12"
       - key: TOKEN_TTL_SECONDS
@@ -40,11 +40,10 @@ services:
       - key: FACILITIES_LOG_INFO
         value: "true"
 
-      # --- SpotHero updater knobs (pacing already tuned in your code) ---
       - key: SH_UPDATE_ENABLED
         value: "true"
       - key: SH_UPDATE_INTERVAL_SECONDS
-        value: "14400" # every 4h
+        value: "14400"
       - key: SH_UPDATE_ONLY_TIERED
         value: "true"
       - key: SH_UPDATE_DRY_RUN
@@ -60,16 +59,5 @@ services:
       - key: SH_UPDATE_JITTER_SEC
         value: "0.15"
 
-      # --- Logging ---
       - key: LOG_LEVEL
         value: "INFO"
-
-    healthCheckPath: /healthz
-    # healthCheckIntervalSeconds: 30  # optional (Render defaults are fine)
-
-    # If you want token.json/files to persist across deploys, add a disk:
-    # (Not strictly required since you download token.json each startup.)
-    # disks:
-    #   - name: app-data
-    #     mountPath: /opt/render/project/src/files
-    #     sizeGB: 1

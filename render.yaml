@@ -1,20 +1,14 @@
 services:
   - type: worker
     name: spothero-facilities-minimal-worker
-    env: python
+    runtime: python # use 'runtime', not 'env'
     region: oregon
     plan: free
     autoDeploy: true
-
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-
-    # Workers do NOT get $PORT by default; provide a fallback.
-    # This keeps uvicorn happy so your FastAPI lifespan tasks (refresh_loop + sh_update_loop) run.
-    startCommand: >
-      uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level warning
-
+    startCommand: python main.py # <— no $PORT needed
     envVars:
       - key: GRAPH_TENANT_ID
         sync: false
@@ -28,7 +22,6 @@ services:
         sync: false
       - key: SP_TOKEN_JSON_PATH
         value: Business Optimization/Automation/token/token.json
-
       - key: TOKEN_REFRESH_HOURS
         value: "12"
       - key: TOKEN_TTL_SECONDS
@@ -39,7 +32,6 @@ services:
         value: "true"
       - key: FACILITIES_LOG_INFO
         value: "true"
-
       - key: SH_UPDATE_ENABLED
         value: "true"
       - key: SH_UPDATE_INTERVAL_SECONDS
@@ -58,6 +50,5 @@ services:
         value: "0.25"
       - key: SH_UPDATE_JITTER_SEC
         value: "0.15"
-
       - key: LOG_LEVEL
         value: "INFO"

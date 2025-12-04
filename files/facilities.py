@@ -130,7 +130,7 @@ def _coerce_json(r: httpx.Response) -> Any:
         except Exception:
             return None
 
-# --------------------------- Matching ----------------------------------
+# --------------------------- Matching ---------------------------------
 
 _SUFFIX_RX = re.compile(r"\s*-\s*(?:garage|lot|deck)\b", re.I)
 _WS_RX = re.compile(r"\s+")

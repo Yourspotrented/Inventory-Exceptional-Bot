@@ -1,9 +1,8 @@
-# File: files/spothero_tool.py
-
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import time
 
 from dataclasses import dataclass
@@ -14,6 +13,10 @@ from zoneinfo import ZoneInfo
 
 BASE_URL = "https://spothero.com/api/v1"
 DEFAULT_TZ = "America/Chicago"
+
+# Teams webhook (optional)
+TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
+TEAMS_NOTIFY_DRY_RUN = (os.getenv("TEAMS_NOTIFY_DRY_RUN", "false").lower() in {"1", "true", "yes"})
 
 
 # ---------- Models (LOCAL time only) ----------
@@ -111,6 +114,29 @@ class SpotHeroClient:
     def _log(debug: bool, *parts: Any) -> None:
         if debug:
             print(*parts, flush=True)
+
+    # --- API: facility details (best-effort; optional) ---
+    def get_facility_details(self, facility_id: int) -> Dict[str, Any]:
+        """
+        Best-effort call to enrich Teams cards with name/title.
+        If this 404/401s or payload differs, we just return {}.
+        """
+        try:
+            url = f"{self.base_url}/facilities/{facility_id}/"
+            r = self._send("GET", url, expect_status=(200, 204))
+            data = r.json() if r.text else {}
+            # Try common shapes
+            if isinstance(data, dict):
+                d = data.get("data") or data
+                name = d.get("name") or d.get("title") or d.get("display_name") or ""
+                title = d.get("title") or d.get("name") or ""
+                return {
+                    "name": str(name) if name else "",
+                    "title": str(title) if title else "",
+                }
+        except Exception:
+            pass
+        return {}
 
     # --- API: inventory-rules-range (GET) ---
     def get_inventory_rules_range(self, facility_id: int, range_start_date: dt.date, tz_name: str) -> List[InventoryRule]:
@@ -384,6 +410,229 @@ def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local
     return True, "overlaps"
 
 
+# ---------- Teams notifier (Adaptive Card) ----------
+def _post_teams_card(card: Dict[str, Any]) -> None:
+    if not TEAMS_WEBHOOK_URL:
+        return  # silently no-op
+    try:
+        payload = {
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": card
+            }]
+        }
+        requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception:
+        # never break control flow due to notifications
+        pass
+
+
+def _fmt_local(ts: Optional[dt.datetime]) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M %Z") if ts else "—"
+
+# --- Add these helpers (place them above _build_change_card) -----------------
+def _tier_header_row() -> Dict[str, Any]:
+    return {
+        "type": "ColumnSet",
+        "spacing": "Small",
+        "separator": True,
+        "columns": [
+            {"type": "Column", "width": "auto",
+             "items": [{"type": "TextBlock", "text": "Tier", "weight": "Bolder"}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": "Price", "weight": "Bolder"}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": "Old Inv.", "weight": "Bolder"}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": "New Inv.", "weight": "Bolder"}]},
+        ],
+    }
+
+
+def _tier_row(order: int, price: int, inv_old: int, inv_new: int) -> Dict[str, Any]:
+    return {
+        "type": "ColumnSet",
+        "spacing": "None",
+        "columns": [
+            {"type": "Column", "width": "auto",
+             "items": [{"type": "TextBlock", "text": str(order)}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": f"${price}"}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": str(inv_old)}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": str(inv_new)}]},
+        ],
+    }
+
+
+
+# --- REPLACE your current _build_change_card with this version ---------------
+def _build_change_card(
+    *,
+    facility_id: int,
+    facility_name: str,
+    facility_title: str,
+    tz_name: str,
+    rule_from: dt.datetime,
+    rule_to: dt.datetime,
+    rule_qty: int,  # kept in signature for compatibility; not shown on card
+    event: EventInfo,
+    before_pairs: List[Tuple[int, int, int]],   # (order, price, inv_before)
+    desired_pairs: List[Tuple[int, int, int]],  # (order, price, inv_new)
+    after_pairs: Optional[List[Tuple[int, int, int]]],
+    applied: Optional[bool],
+    dry_run: bool,
+    status: str,
+) -> Dict[str, Any]:
+    """
+    Simplified card:
+      - Header
+      - Summary with Old Inventory (total) and New Inventory (total)
+      - Details (Facility, Facility ID, Rule Window, Applied, Event)
+    Excludes: Offsets, Per-tier Allocation table, Prices, Rule Qty.
+    """
+    def sum_inv(pairs: List[Tuple[int, int, int]]) -> int:
+        return sum(inv for _, _, inv in pairs)
+
+    old_total = sum_inv(before_pairs)
+    new_total = sum_inv(desired_pairs)
+
+    subheader = (
+        "Inventory Update (Dry-run)" if dry_run else
+        "Inventory Verify Mismatch" if status == "verify_mismatch" else
+        "Inventory Update Exception" if status == "exception" else
+        "Inventory Update — Applied"
+    )
+
+    card: Dict[str, Any] = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": [
+            # Header band
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": [
+                    {"type": "TextBlock", "text": subheader, "weight": "Bolder", "size": "Large"},
+                    {"type": "TextBlock", "text": "SpotHero Inventory Bot", "isSubtle": True, "spacing": "None"},
+                ],
+            },
+
+            # Summary (only Old/New totals)
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock", "text": "Summary", "weight": "Bolder", "size": "Medium"},
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column", "width": "stretch",
+                                "items": [
+                                    {"type": "TextBlock", "text": "Old Inventory", "isSubtle": True},
+                                    {"type": "TextBlock", "text": str(old_total), "weight": "Bolder", "size": "Medium"},
+                                ],
+                            },
+                            {
+                                "type": "Column", "width": "stretch",
+                                "items": [
+                                    {"type": "TextBlock", "text": "New Inventory", "isSubtle": True},
+                                    {"type": "TextBlock", "text": str(new_total), "weight": "Bolder", "size": "Medium"},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+
+            # Details facts (no Offsets)
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock", "text": "Details", "weight": "Bolder", "size": "Medium"},
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
+                            {"title": "Facility ID", "value": str(facility_id)},
+                            {"title": "Rule Window", "value": f"{_fmt_local(rule_from)} -> {_fmt_local(rule_to)} ({tz_name})"},
+                            {"title": "Applied", "value": "true" if applied else ("false" if applied is not None else "n/a")},
+                            {"title": "Event", "value": f"#{event.event_id}  { _fmt_local(event.event_starts_local) } -> { _fmt_local(event.event_ends_local) }"},
+                        ],
+                    },
+                ],
+            },
+
+            # Footer
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock",
+                     "text": "Posted by Flow bot • Values are local to America/Chicago",
+                     "isSubtle": True, "size": "Small"}
+                ],
+            },
+        ],
+        "actions": [
+            {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}
+        ],
+    }
+
+    return card
+
+
+
+def _build_exception_card(
+    *,
+    facility_id: int,
+    facility_name: str,
+    facility_title: str,
+    tz_name: str,
+    rule_from: dt.datetime,
+    rule_to: dt.datetime,
+    rule_qty: int,
+    event: Optional[EventInfo],
+    error_text: str,
+) -> Dict[str, Any]:
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": [
+            {"type": "TextBlock", "text": "Inventory Update Exception", "weight": "Bolder", "size": "Large"},
+            {"type": "TextBlock", "text": f"Facility: {facility_title or facility_name or str(facility_id)}", "wrap": True},
+            {"type": "FactSet", "facts": [
+                {"title": "Facility ID", "value": str(facility_id)},
+                {"title": "Facility Name", "value": facility_name or "—"},
+                {"title": "Facility Title", "value": facility_title or "—"},
+                {"title": "Rule Window", "value": f"{_fmt_local(rule_from)} → {_fmt_local(rule_to)} ({tz_name})"},
+                {"title": "Total Stalls (rule qty)", "value": str(rule_qty)},
+            ]},
+            {"type": "TextBlock", "text": f"Error: {error_text[:600]}", "wrap": True, "spacing": "Medium"},
+            {"type": "TextBlock", "text": (f"Event #{event.event_id}" if event else "Event: n/a"), "isSubtle": True, "wrap": True},
+        ],
+        "actions": [
+            {
+                "type": "ActionSet",
+                "actions": [
+                    { "type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator" }
+                ]
+            }
+        ],
+        "style": "attention"
+    }
+
+
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
     auth_token: str,
@@ -402,6 +651,11 @@ def run_update_for_facility_all_rules(
     tz = ZoneInfo(tz_name)
     today_local = dt.datetime.now(tz).date()
     client = SpotHeroClient(token=auth_token)
+
+    # Try to enrich with facility details (optional; non-fatal)
+    fac_detail = client.get_facility_details(facility_id) if TEAMS_WEBHOOK_URL else {}
+    facility_name = fac_detail.get("name", "") if isinstance(fac_detail, dict) else ""
+    facility_title = fac_detail.get("title", "") if isinstance(fac_detail, dict) else ""
 
     # 1) Get rules (localized)
     rules = client.get_inventory_rules_range(facility_id=facility_id, range_start_date=today_local, tz_name=tz_name)
@@ -490,19 +744,53 @@ def run_update_for_facility_all_rules(
                 client._log(debug,
                     f"[POST] event_id={ev.event_id} qty={rule.quantity} offsets=({ev.starts_offset},{ev.ends_offset})"
                 )
-                post_result = client.post_tiered_event_rating_rules(
-                    facility_id=facility_id,
-                    event_ids=[ev.event_id],
-                    tiers=desired,
-                    event_starts_offset=ev.starts_offset,
-                    event_ends_offset=ev.ends_offset,
-                    rule_id=ev.rule_id,
-                    stop_selling_before_duration=None,
-                    dry_run=dry_run,
-                )
-                client._log(debug, "[POST][resp]", post_result)
+                # --- POST with exception notification but re-raise to preserve flow
+                try:
+                    post_result = client.post_tiered_event_rating_rules(
+                        facility_id=facility_id,
+                        event_ids=[ev.event_id],
+                        tiers=desired,
+                        event_starts_offset=ev.starts_offset,
+                        event_ends_offset=ev.ends_offset,
+                        rule_id=ev.rule_id,
+                        stop_selling_before_duration=None,
+                        dry_run=dry_run,
+                    )
+                    client._log(debug, "[POST][resp]", post_result)
+                except Exception as e:
+                    # Teams exception card
+                    _post_teams_card(_build_exception_card(
+                        facility_id=facility_id,
+                        facility_name=facility_name,
+                        facility_title=facility_title,
+                        tz_name=tz_name,
+                        rule_from=rule.valid_from_local,
+                        rule_to=rule.valid_to_local,
+                        rule_qty=rule.quantity,
+                        event=ev,
+                        error_text=str(e),
+                    ))
+                    raise
 
-                if not dry_run:
+                if dry_run:
+                    if TEAMS_NOTIFY_DRY_RUN:
+                        _post_teams_card(_build_change_card(
+                            facility_id=facility_id,
+                            facility_name=facility_name,
+                            facility_title=facility_title,
+                            tz_name=tz_name,
+                            rule_from=rule.valid_from_local,
+                            rule_to=rule.valid_to_local,
+                            rule_qty=rule.quantity,
+                            event=ev,
+                            before_pairs=before_pairs,
+                            desired_pairs=desired_pairs,
+                            after_pairs=None,
+                            applied=None,
+                            dry_run=True,
+                            status="dry_run",
+                        ))
+                else:
                     # Verify by re-fetching the event on its local start day
                     ev_day = ev.event_starts_local.date() if ev.event_starts_local else from_date
                     chk = client.get_event_on_day(
@@ -517,10 +805,41 @@ def run_update_for_facility_all_rules(
                         verify_after = _tiers_pairs(chk.tiers)
                         applied = (verify_after == desired_pairs)
                         client._log(debug, f"[VERIFY] event_id={ev.event_id} after={verify_after} applied={applied}")
-                        if verify_after != desired_pairs:
-                            client._log(debug,
-                                "[WARN] Verify-after differs; SpotHero may have blocked reduction (used inventory/constraints)."
-                            )
+                        # Teams success / mismatch cards
+                        if applied:
+                            _post_teams_card(_build_change_card(
+                                facility_id=facility_id,
+                                facility_name=facility_name,
+                                facility_title=facility_title,
+                                tz_name=tz_name,
+                                rule_from=rule.valid_from_local,
+                                rule_to=rule.valid_to_local,
+                                rule_qty=rule.quantity,
+                                event=ev,
+                                before_pairs=before_pairs,
+                                desired_pairs=desired_pairs,
+                                after_pairs=verify_after,
+                                applied=True,
+                                dry_run=False,
+                                status="applied",
+                            ))
+                        else:
+                            _post_teams_card(_build_change_card(
+                                facility_id=facility_id,
+                                facility_name=facility_name,
+                                facility_title=facility_title,
+                                tz_name=tz_name,
+                                rule_from=rule.valid_from_local,
+                                rule_to=rule.valid_to_local,
+                                rule_qty=rule.quantity,
+                                event=ev,
+                                before_pairs=before_pairs,
+                                desired_pairs=desired_pairs,
+                                after_pairs=verify_after,
+                                applied=False,
+                                dry_run=False,
+                                status="verify_mismatch",
+                            ))
             else:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — tiers already match desired allocation.")
 

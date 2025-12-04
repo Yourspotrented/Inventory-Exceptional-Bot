@@ -1,14 +1,19 @@
+# render.yaml (worker)
 services:
   - type: worker
     name: spothero-facilities-minimal-worker
-    runtime: python # use 'runtime', not 'env'
+    runtime: python
     region: oregon
     plan: free
     autoDeploy: true
+
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-    startCommand: python main.py # <— no $PORT needed
+
+    # No $PORT on workers; your main.py starts uvicorn itself.
+    startCommand: python main.py
+
     envVars:
       - key: GRAPH_TENANT_ID
         sync: false
@@ -22,15 +27,9 @@ services:
         sync: false
       - key: SP_TOKEN_JSON_PATH
         value: Business Optimization/Automation/token/token.json
-      - key: TOKEN_REFRESH_HOURS
-        value: "12"
-      - key: TOKEN_TTL_SECONDS
-        value: "900"
-      - key: FACILITIES_TTL_SECONDS
-        value: "600"
+
+      # Optional behavior knobs (match your code defaults)
       - key: STARTUP_FORCE_GRAPH_REFRESH
-        value: "true"
-      - key: FACILITIES_LOG_INFO
         value: "true"
       - key: SH_UPDATE_ENABLED
         value: "true"

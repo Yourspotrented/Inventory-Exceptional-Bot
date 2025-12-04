@@ -281,6 +281,9 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
     max_conc = max(1, int(settings.SH_UPDATE_MAX_CONCURRENCY))
     sem = asyncio.Semaphore(max_conc)
 
+    # map reused by worker for nicer logs (id -> name)
+    name_map: Dict[int, str] = {}
+
     async def _one(fid: int, token: str) -> bool:
         async with sem:
             try:
@@ -295,7 +298,11 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
                 )
                 return True
             except Exception as e:
-                log.info("SH updater: facility %s skipped: %s", fid, str(e)[:200])
+                fname = name_map.get(fid, "")
+                if fname:
+                    log.info("SH updater: facility %s (%s) skipped: %s", fid, fname, str(e)[:200])
+                else:
+                    log.info("SH updater: facility %s skipped: %s", fid, str(e)[:200])
                 return False
 
     while not stop_evt.is_set():
@@ -317,6 +324,15 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
                 ]
             else:
                 fsel = items
+
+            # (re)build name map for this batch without rebinding the dict
+            name_map.clear()
+            for it in fsel:
+                try:
+                    fid_int = int(it.get("id"))
+                    name_map[fid_int] = str(it.get("name") or "")
+                except Exception:
+                    continue
 
             fids: List[int] = []
             for it in fsel:

@@ -1,3 +1,4 @@
+# files/spothero_tool.py
 from __future__ import annotations
 
 import datetime as dt
@@ -17,7 +18,8 @@ DEFAULT_TZ = "America/Chicago"
 # Teams webhook (optional)
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
 TEAMS_NOTIFY_DRY_RUN = (os.getenv("TEAMS_NOTIFY_DRY_RUN", "false").lower() in {"1", "true", "yes"})
-
+# Enforce updates only when an inventory *exception* rule is active
+ENFORCE_ONLY_IF_INVENTORY_EXCEPTION = (os.getenv("ENFORCE_ONLY_IF_INVENTORY_EXCEPTION", "true").lower() in {"1", "true", "yes"})
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -91,7 +93,6 @@ class SpotHeroClient:
                 )
                 if r.status_code in expect_status:
                     return r
-                # retry only on transient codes
                 if r.status_code not in RETRY_STATUS:
                     msg = (
                         f"{r.status_code} {r.reason} {method} {url} | "
@@ -101,7 +102,6 @@ class SpotHeroClient:
             except requests.RequestException as e:
                 last_exc = e
 
-            # transient -> backoff and retry
             time.sleep(backoff)
             backoff = min(backoff * 2.0, 6.0)
 
@@ -117,15 +117,10 @@ class SpotHeroClient:
 
     # --- API: facility details (best-effort; optional) ---
     def get_facility_details(self, facility_id: int) -> Dict[str, Any]:
-        """
-        Best-effort call to enrich Teams cards with name/title.
-        If this 404/401s or payload differs, we just return {}.
-        """
         try:
             url = f"{self.base_url}/facilities/{facility_id}/"
             r = self._send("GET", url, expect_status=(200, 204))
             data = r.json() if r.text else {}
-            # Try common shapes
             if isinstance(data, dict):
                 d = data.get("data") or data
                 name = d.get("name") or d.get("title") or d.get("display_name") or ""
@@ -140,10 +135,6 @@ class SpotHeroClient:
 
     # --- API: inventory-rules-range (GET) ---
     def get_inventory_rules_range(self, facility_id: int, range_start_date: dt.date, tz_name: str) -> List[InventoryRule]:
-        """
-        API returns valid_from/valid_to as ISO (often with Z/UTC). We convert ONCE to local tz
-        (America/Chicago) and keep local everywhere else.
-        """
         tz = ZoneInfo(tz_name)
         params = {"range_starts": self._fmt_range_starts(range_start_date)}
         url = f"{self.base_url}/facilities/{facility_id}/inventory-rules-range/"
@@ -159,14 +150,13 @@ class SpotHeroClient:
             if item.get("is_expired"):
                 continue
 
-            vf_raw = item.get("valid_from")   # e.g. "2025-12-28T00:00:00Z"
+            vf_raw = item.get("valid_from")
             vt_raw = item.get("valid_to")
             try:
                 vf = dt.datetime.fromisoformat(vf_raw.replace("Z", "+00:00"))
                 vt = dt.datetime.fromisoformat(vt_raw.replace("Z", "+00:00"))
             except Exception:
                 continue
-            # convert to local tz and keep local
             vf_local = vf.astimezone(tz)
             vt_local = vt.astimezone(tz)
 
@@ -197,7 +187,6 @@ class SpotHeroClient:
             "to_date": self._date_yyyy_mm_dd(to_date),
             "page": page,
         }
-        # Accept either spelling if present
         if per_page is not None:
             params["perPage"] = int(per_page)
             params["per_page"] = int(per_page)
@@ -235,9 +224,6 @@ class SpotHeroClient:
         max_pages: int = 30,
         debug: bool = False,
     ) -> Iterable[Dict[str, Any]]:
-        """
-        Page-walks 1..pages (or until empty) to fetch all events in the date span.
-        """
         first = self.get_upcoming_events_page(
             facility_id, from_date, to_date, page=1, per_page=per_page, debug=debug
         )
@@ -345,16 +331,11 @@ class SpotHeroClient:
 
 # ---------- Helpers (LOCAL parsing & logic) ----------
 def _parse_event_local(ev: Dict[str, Any], tz_name: str) -> EventInfo:
-    """
-    Parse times exactly as API gives (local strings like 'YYYY-MM-DDTHH:MM'),
-    attach America/Chicago tz. Prefer reservation_* over event_* for overlap.
-    """
     tz = ZoneInfo(tz_name)
     tiers = ev.get("tiers") or []
     start_off = ev.get("event_starts_offset_display") or ev.get("event_starts_offset") or "00:00"
     end_off = ev.get("event_ends_offset_display") or ev.get("event_ends_offset") or "00:00"
 
-    # Reservation-first to match booking windows
     e_starts_s = ev.get("reservation_starts") or ev.get("event_starts")
     e_ends_s   = ev.get("reservation_ends")   or ev.get("event_ends")
 
@@ -382,7 +363,6 @@ def _parse_event_local(ev: Dict[str, Any], tz_name: str) -> EventInfo:
 
 
 def _tiers_pairs(tiers: List[Dict[str, Any]]) -> List[Tuple[int, int, int]]:
-    # (order, price, inventory) sorted by order
     return sorted([(int(t["order"]), int(t["price"]), int(t.get("inventory", 0))) for t in tiers], key=lambda x: x[0])
 
 
@@ -400,7 +380,6 @@ def _alloc_inventory(tiers: List[Dict[str, Any]], total_qty: int) -> List[Dict[s
 
 
 def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
-    # All arguments are tz-aware in America/Chicago
     if not ev.event_starts_local or not ev.event_ends_local:
         return False, "missing start/end"
     if ev.event_ends_local <= win_from_local:
@@ -413,7 +392,7 @@ def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local
 # ---------- Teams notifier (Adaptive Card) ----------
 def _post_teams_card(card: Dict[str, Any]) -> None:
     if not TEAMS_WEBHOOK_URL:
-        return  # silently no-op
+        return
     try:
         payload = {
             "type": "message",
@@ -425,14 +404,13 @@ def _post_teams_card(card: Dict[str, Any]) -> None:
         }
         requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
     except Exception:
-        # never break control flow due to notifications
         pass
 
 
 def _fmt_local(ts: Optional[dt.datetime]) -> str:
     return ts.strftime("%Y-%m-%d %H:%M %Z") if ts else "—"
 
-# --- Add these helpers (place them above _build_change_card) -----------------
+
 def _tier_header_row() -> Dict[str, Any]:
     return {
         "type": "ColumnSet",
@@ -468,8 +446,6 @@ def _tier_row(order: int, price: int, inv_old: int, inv_new: int) -> Dict[str, A
     }
 
 
-
-# --- REPLACE your current _build_change_card with this version ---------------
 def _build_change_card(
     *,
     facility_id: int,
@@ -478,22 +454,15 @@ def _build_change_card(
     tz_name: str,
     rule_from: dt.datetime,
     rule_to: dt.datetime,
-    rule_qty: int,  # kept in signature for compatibility; not shown on card
+    rule_qty: int,
     event: EventInfo,
-    before_pairs: List[Tuple[int, int, int]],   # (order, price, inv_before)
-    desired_pairs: List[Tuple[int, int, int]],  # (order, price, inv_new)
+    before_pairs: List[Tuple[int, int, int]],
+    desired_pairs: List[Tuple[int, int, int]],
     after_pairs: Optional[List[Tuple[int, int, int]]],
     applied: Optional[bool],
     dry_run: bool,
     status: str,
 ) -> Dict[str, Any]:
-    """
-    Simplified card:
-      - Header
-      - Summary with Old Inventory (total) and New Inventory (total)
-      - Details (Facility, Facility ID, Rule Window, Applied, Event)
-    Excludes: Offsets, Per-tier Allocation table, Prices, Rule Qty.
-    """
     def sum_inv(pairs: List[Tuple[int, int, int]]) -> int:
         return sum(inv for _, _, inv in pairs)
 
@@ -513,7 +482,6 @@ def _build_change_card(
         "version": "1.5",
         "msteams": {"width": "Full"},
         "body": [
-            # Header band
             {
                 "type": "Container",
                 "style": "emphasis",
@@ -523,8 +491,6 @@ def _build_change_card(
                     {"type": "TextBlock", "text": "SpotHero Inventory Bot", "isSubtle": True, "spacing": "None"},
                 ],
             },
-
-            # Summary (only Old/New totals)
             {
                 "type": "Container",
                 "spacing": "Medium",
@@ -551,8 +517,6 @@ def _build_change_card(
                     },
                 ],
             },
-
-            # Details facts (no Offsets)
             {
                 "type": "Container",
                 "spacing": "Medium",
@@ -570,8 +534,6 @@ def _build_change_card(
                     },
                 ],
             },
-
-            # Footer
             {
                 "type": "Container",
                 "spacing": "Medium",
@@ -588,7 +550,6 @@ def _build_change_card(
     }
 
     return card
-
 
 
 def _build_exception_card(
@@ -633,6 +594,22 @@ def _build_exception_card(
     }
 
 
+# --- helper: robustly detect if a rule is an exception ---
+def _is_rule_exception(raw: Dict[str, Any]) -> bool:
+    # Different tenants use different flags; keep this tolerant.
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("is_exception") is True:
+        return True
+    if raw.get("exception") is True:
+        return True
+    if str(raw.get("rule_type", "")).lower() == "exception":
+        return True
+    if raw.get("is_default") is False:
+        return True
+    return False
+
+
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
     auth_token: str,
@@ -641,23 +618,14 @@ def run_update_for_facility_all_rules(
     dry_run: bool = False,
     debug: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Everything in LOCAL (America/Chicago) time:
-      1) GET all inventory rules for today's Chicago window -> convert to LOCAL and keep local.
-      2) Build a GLOBAL local-date span that covers all rules.
-      3) Fetch ALL upcoming events across that global span with explicit page-walk (cap 30 pages).
-      4) For each rule, filter by true LOCAL overlap and POST only when tiers differ.
-    """
     tz = ZoneInfo(tz_name)
     today_local = dt.datetime.now(tz).date()
     client = SpotHeroClient(token=auth_token)
 
-    # Try to enrich with facility details (optional; non-fatal)
     fac_detail = client.get_facility_details(facility_id) if TEAMS_WEBHOOK_URL else {}
     facility_name = fac_detail.get("name", "") if isinstance(fac_detail, dict) else ""
     facility_title = fac_detail.get("title", "") if isinstance(fac_detail, dict) else ""
 
-    # 1) Get rules (localized)
     rules = client.get_inventory_rules_range(facility_id=facility_id, range_start_date=today_local, tz_name=tz_name)
     if not rules:
         raise RuntimeError(f"No inventory rules for facility {facility_id} on {today_local} (tz={tz_name})")
@@ -671,14 +639,12 @@ def run_update_for_facility_all_rules(
             "| valid_to_local=", r.valid_to_local
         )
 
-    # 2) Global span (local dates)
     vf_list = [r.valid_from_local.date() for r in rules]
     vt_list = [r.valid_to_local.date() for r in rules]
     global_from = min(vf_list)
     global_to = max(vt_list)
     client._log(debug, f"[global window local] from={global_from} to={global_to}")
 
-    # 3) Fetch ALL events for the global span
     all_events_raw = list(
         client.iter_upcoming_events(
             facility_id,
@@ -708,10 +674,12 @@ def run_update_for_facility_all_rules(
         "processed": [],
     }
 
-    # 4) Per rule, filter + update when needed (all LOCAL)
+    # Only send Teams messages if a verified change was applied, and only if the driving rule is an EXCEPTION.
     for rule in rules:
         from_date = rule.valid_from_local.date()
         to_date = max(rule.valid_from_local.date(), rule.valid_to_local.date())
+
+        rule_is_exception = _is_rule_exception(rule.raw)
 
         matched: List[Dict[str, Any]] = []
         overlapped_count = 0
@@ -722,6 +690,11 @@ def run_update_for_facility_all_rules(
             if not ok:
                 if debug and len(non_overlap_debug) < 10:
                     non_overlap_debug.append(f"event {ev.event_id}: {why}")
+                continue
+
+            # >>> Guard: do nothing if there is NO exception <<<
+            if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not rule_is_exception:
+                client._log(debug, f"[SKIP] event_id={ev.event_id} — rule is not an exception.")
                 continue
 
             overlapped_count += 1
@@ -744,7 +717,6 @@ def run_update_for_facility_all_rules(
                 client._log(debug,
                     f"[POST] event_id={ev.event_id} qty={rule.quantity} offsets=({ev.starts_offset},{ev.ends_offset})"
                 )
-                # --- POST with exception notification but re-raise to preserve flow
                 try:
                     post_result = client.post_tiered_event_rating_rules(
                         facility_id=facility_id,
@@ -758,40 +730,12 @@ def run_update_for_facility_all_rules(
                     )
                     client._log(debug, "[POST][resp]", post_result)
                 except Exception as e:
-                    # Teams exception card
-                    _post_teams_card(_build_exception_card(
-                        facility_id=facility_id,
-                        facility_name=facility_name,
-                        facility_title=facility_title,
-                        tz_name=tz_name,
-                        rule_from=rule.valid_from_local,
-                        rule_to=rule.valid_to_local,
-                        rule_qty=rule.quantity,
-                        event=ev,
-                        error_text=str(e),
-                    ))
+                    # No Teams on exceptions; preserve failure semantics
                     raise
 
                 if dry_run:
-                    if TEAMS_NOTIFY_DRY_RUN:
-                        _post_teams_card(_build_change_card(
-                            facility_id=facility_id,
-                            facility_name=facility_name,
-                            facility_title=facility_title,
-                            tz_name=tz_name,
-                            rule_from=rule.valid_from_local,
-                            rule_to=rule.valid_to_local,
-                            rule_qty=rule.quantity,
-                            event=ev,
-                            before_pairs=before_pairs,
-                            desired_pairs=desired_pairs,
-                            after_pairs=None,
-                            applied=None,
-                            dry_run=True,
-                            status="dry_run",
-                        ))
+                    pass
                 else:
-                    # Verify by re-fetching the event on its local start day
                     ev_day = ev.event_starts_local.date() if ev.event_starts_local else from_date
                     chk = client.get_event_on_day(
                         facility_id=facility_id,
@@ -805,7 +749,7 @@ def run_update_for_facility_all_rules(
                         verify_after = _tiers_pairs(chk.tiers)
                         applied = (verify_after == desired_pairs)
                         client._log(debug, f"[VERIFY] event_id={ev.event_id} after={verify_after} applied={applied}")
-                        # Teams success / mismatch cards
+
                         if applied:
                             _post_teams_card(_build_change_card(
                                 facility_id=facility_id,
@@ -822,23 +766,6 @@ def run_update_for_facility_all_rules(
                                 applied=True,
                                 dry_run=False,
                                 status="applied",
-                            ))
-                        else:
-                            _post_teams_card(_build_change_card(
-                                facility_id=facility_id,
-                                facility_name=facility_name,
-                                facility_title=facility_title,
-                                tz_name=tz_name,
-                                rule_from=rule.valid_from_local,
-                                rule_to=rule.valid_to_local,
-                                rule_qty=rule.quantity,
-                                event=ev,
-                                before_pairs=before_pairs,
-                                desired_pairs=desired_pairs,
-                                after_pairs=verify_after,
-                                applied=False,
-                                dry_run=False,
-                                status="verify_mismatch",
                             ))
             else:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — tiers already match desired allocation.")
@@ -859,12 +786,11 @@ def run_update_for_facility_all_rules(
                 "tiers_before": before_pairs,
                 "tiers_desired": desired_pairs,
                 "skipped_no_change": identical,
-                "post_result": post_result if dry_run else None,  # keep payload visible only in dry-run
+                "post_result": post_result if dry_run else None,
                 "tiers_after_verify": verify_after,
                 "applied": applied,
             })
 
-        # Clean, single-line rule summary when debug on
         client._log(debug, f"[rule] {from_date}→{to_date} qty={rule.quantity} | overlap_events={overlapped_count}")
         if debug and non_overlap_debug:
             client._log(debug, "   examples of non-overlap reasons:")

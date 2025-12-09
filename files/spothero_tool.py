@@ -331,13 +331,17 @@ class SpotHeroClient:
 
 # ---------- Helpers (LOCAL parsing & logic) ----------
 def _parse_event_local(ev: Dict[str, Any], tz_name: str) -> EventInfo:
+    """
+    Use ONLY the event's own start/end (no reservation/offset shift).
+    """
     tz = ZoneInfo(tz_name)
     tiers = ev.get("tiers") or []
     start_off = ev.get("event_starts_offset_display") or ev.get("event_starts_offset") or "00:00"
     end_off = ev.get("event_ends_offset_display") or ev.get("event_ends_offset") or "00:00"
 
-    e_starts_s = ev.get("reservation_starts") or ev.get("event_starts")
-    e_ends_s   = ev.get("reservation_ends")   or ev.get("event_ends")
+    # Strictly use event times (not reservation_*). This avoids offset-based windows.
+    e_starts_s = ev.get("event_starts")
+    e_ends_s   = ev.get("event_ends")
 
     def parse_local(s: Optional[str]) -> Optional[dt.datetime]:
         if not s:
@@ -380,6 +384,7 @@ def _alloc_inventory(tiers: List[Dict[str, Any]], total_qty: int) -> List[Dict[s
 
 
 def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
+    # kept for compatibility (overlap semantics); not used for decisions anymore
     if not ev.event_starts_local or not ev.event_ends_local:
         return False, "missing start/end"
     if ev.event_ends_local <= win_from_local:
@@ -387,6 +392,74 @@ def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local
     if ev.event_starts_local >= win_to_local:
         return False, f"starts({ev.event_starts_local}) >= win_to({win_to_local})"
     return True, "overlaps"
+
+
+def _event_contained_in(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
+    # require full containment: rule window must fully contain the event window
+    if not ev.event_starts_local or not ev.event_ends_local:
+        return False, "missing start/end"
+    if ev.event_starts_local < win_from_local:
+        return False, f"event_starts({ev.event_starts_local}) < rule_from({win_from_local})"
+    if ev.event_ends_local > win_to_local:
+        return False, f"event_ends({ev.event_ends_local}) > rule_to({win_to_local})"
+    return True, "contained"
+
+
+def _overlap_minutes(a_from: dt.datetime, a_to: dt.datetime, b_from: dt.datetime, b_to: dt.datetime) -> int:
+    start = max(a_from, b_from)
+    end = min(a_to, b_to)
+    return max(0, int((end - start).total_seconds() // 60))
+
+
+def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
+    return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
+
+
+def _is_rule_exception(raw: Dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("is_exception") is True:
+        return True
+    if raw.get("exception") is True:
+        return True
+    if str(raw.get("rule_type", "")).lower() == "exception":
+        return True
+    if raw.get("is_default") is False:
+        return True
+    return False
+
+
+def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
+    """
+    Among rules that FULLY CONTAIN the event and are exceptions, pick controller:
+      1) Prefer exact time match.
+      2) Else choose minimal quantity.
+      3) Tie-break by largest overlap minutes, then latest valid_from.
+    Returns (target_qty, controller_rule) or (None, None) if none contain.
+    """
+    contenders: List[Tuple[InventoryRule, int, bool]] = []
+    for r in rules:
+        if not _is_rule_exception(r.raw):
+            continue
+        ok, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
+        if not ok:
+            continue
+        minutes = _overlap_minutes(r.valid_from_local, r.valid_to_local,
+                                   ev.event_starts_local, ev.event_ends_local)
+        contenders.append((r, minutes, _is_exact_window_match(ev, r)))
+
+    if not contenders:
+        return None, None
+
+    exacts = [c for c in contenders if c[2] is True]
+    pool = exacts if exacts else contenders
+
+    min_qty = min(c[0].quantity for c in pool)
+    pool = [c for c in pool if c[0].quantity == min_qty]
+
+    pool.sort(key=lambda c: (c[1], c[0].valid_from_local), reverse=True)
+    controller = pool[0][0]
+    return controller.quantity, controller
 
 
 # ---------- Teams notifier (Adaptive Card) ----------
@@ -594,22 +667,6 @@ def _build_exception_card(
     }
 
 
-# --- helper: robustly detect if a rule is an exception ---
-def _is_rule_exception(raw: Dict[str, Any]) -> bool:
-    # Different tenants use different flags; keep this tolerant.
-    if not isinstance(raw, dict):
-        return False
-    if raw.get("is_exception") is True:
-        return True
-    if raw.get("exception") is True:
-        return True
-    if str(raw.get("rule_type", "")).lower() == "exception":
-        return True
-    if raw.get("is_default") is False:
-        return True
-    return False
-
-
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
     auth_token: str,
@@ -674,7 +731,7 @@ def run_update_for_facility_all_rules(
         "processed": [],
     }
 
-    # Only send Teams messages if a verified change was applied, and only if the driving rule is an EXCEPTION.
+    # Containment-based logic with a single controller per event.
     for rule in rules:
         from_date = rule.valid_from_local.date()
         to_date = max(rule.valid_from_local.date(), rule.valid_to_local.date())
@@ -682,30 +739,42 @@ def run_update_for_facility_all_rules(
         rule_is_exception = _is_rule_exception(rule.raw)
 
         matched: List[Dict[str, Any]] = []
-        overlapped_count = 0
-        non_overlap_debug: List[str] = []
+        considered_count = 0
+        non_contain_debug: List[str] = []
 
         for ev in all_events:
-            ok, why = _event_within_local(ev, rule.valid_from_local, rule.valid_to_local)
+            # Require full containment of the event within the rule window (not overlap)
+            ok, why = _event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)
             if not ok:
-                if debug and len(non_overlap_debug) < 10:
-                    non_overlap_debug.append(f"event {ev.event_id}: {why}")
+                if debug and len(non_contain_debug) < 10:
+                    non_contain_debug.append(f"event {ev.event_id}: {why}")
                 continue
 
-            # >>> Guard: do nothing if there is NO exception <<<
+            # Must be exception when guard is enabled
             if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not rule_is_exception:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — rule is not an exception.")
                 continue
 
-            overlapped_count += 1
-            desired = _alloc_inventory(ev.tiers, rule.quantity)
+            # Determine the *controller* among all containing exception rules
+            target_qty, controller = _containing_controller(rules, ev)
+            if controller is None:
+                client._log(debug, f"[SKIP] event_id={ev.event_id} — no containing exception found.")
+                continue
+            if controller is not rule:
+                client._log(debug, f"[SKIP] event_id={ev.event_id} — another rule controls (qty={target_qty}).")
+                continue
+
+            considered_count += 1
+
+            # Allocate using controller's quantity (not offsets)
+            desired = _alloc_inventory(ev.tiers, target_qty)
             before_pairs = _tiers_pairs(ev.tiers)
             desired_pairs = _tiers_pairs(desired)
             identical = before_pairs == desired_pairs
 
             if debug:
                 client._log(debug,
-                    f"[decision] event_id={ev.event_id} rule_id={ev.rule_id} "
+                    f"[decision] event_id={ev.event_id} controller_qty={target_qty} "
                     f"before={before_pairs} desired={desired_pairs} identical={identical}"
                 )
 
@@ -714,10 +783,9 @@ def run_update_for_facility_all_rules(
             applied: Optional[bool] = None
 
             if not identical:
-                client._log(debug,
-                    f"[POST] event_id={ev.event_id} qty={rule.quantity} offsets=({ev.starts_offset},{ev.ends_offset})"
-                )
+                client._log(debug, f"[POST] event_id={ev.event_id} qty={target_qty}")
                 try:
+                    # Offsets are *not* used for filtering; they are passed through as-is to satisfy API schema.
                     post_result = client.post_tiered_event_rating_rules(
                         facility_id=facility_id,
                         event_ids=[ev.event_id],
@@ -729,13 +797,10 @@ def run_update_for_facility_all_rules(
                         dry_run=dry_run,
                     )
                     client._log(debug, "[POST][resp]", post_result)
-                except Exception as e:
-                    # No Teams on exceptions; preserve failure semantics
+                except Exception:
                     raise
 
-                if dry_run:
-                    pass
-                else:
+                if not dry_run:
                     ev_day = ev.event_starts_local.date() if ev.event_starts_local else from_date
                     chk = client.get_event_on_day(
                         facility_id=facility_id,
@@ -749,7 +814,6 @@ def run_update_for_facility_all_rules(
                         verify_after = _tiers_pairs(chk.tiers)
                         applied = (verify_after == desired_pairs)
                         client._log(debug, f"[VERIFY] event_id={ev.event_id} after={verify_after} applied={applied}")
-
                         if applied:
                             _post_teams_card(_build_change_card(
                                 facility_id=facility_id,
@@ -758,7 +822,7 @@ def run_update_for_facility_all_rules(
                                 tz_name=tz_name,
                                 rule_from=rule.valid_from_local,
                                 rule_to=rule.valid_to_local,
-                                rule_qty=rule.quantity,
+                                rule_qty=target_qty,
                                 event=ev,
                                 before_pairs=before_pairs,
                                 desired_pairs=desired_pairs,
@@ -791,10 +855,10 @@ def run_update_for_facility_all_rules(
                 "applied": applied,
             })
 
-        client._log(debug, f"[rule] {from_date}→{to_date} qty={rule.quantity} | overlap_events={overlapped_count}")
-        if debug and non_overlap_debug:
-            client._log(debug, "   examples of non-overlap reasons:")
-            for line in non_overlap_debug:
+        client._log(debug, f"[rule] {from_date}→{to_date} qty={rule.quantity} | containing_events={considered_count}")
+        if debug and non_contain_debug:
+            client._log(debug, "   examples of non-containment reasons:")
+            for line in non_contain_debug:
                 client._log(debug, "    -", line)
 
         summary["processed"].append({

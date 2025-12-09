@@ -600,9 +600,13 @@ def _build_change_card(
                         "facts": [
                             {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
                             {"title": "Facility ID", "value": str(facility_id)},
-                            {"title": "Rule Window", "value": f"{_fmt_local(rule_from)} -> {_fmt_local(rule_to)} ({tz_name})"},
+                            {"title": "Rule From", "value": f"{_fmt_local(rule_from)} ({tz_name})"},
+                            {"title": "Rule To",   "value": f"{_fmt_local(rule_to)} ({tz_name})"},
+                            {"title": "Event Start", "value": _fmt_local(event.event_starts_local)},
+                            {"title": "Event End",   "value": _fmt_local(event.event_ends_local)},
+                            {"title": "Event ID",    "value": f"#{event.event_id}"},
                             {"title": "Applied", "value": "true" if applied else ("false" if applied is not None else "n/a")},
-                            {"title": "Event", "value": f"#{event.event_id}  { _fmt_local(event.event_starts_local) } -> { _fmt_local(event.event_ends_local) }"},
+                            
                         ],
                     },
                 ],

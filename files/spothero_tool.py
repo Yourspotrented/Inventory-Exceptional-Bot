@@ -770,11 +770,21 @@ def run_update_for_facility_all_rules(
 
             considered_count += 1
 
-            # Allocate using controller's quantity (not offsets)
-            desired = _alloc_inventory(ev.tiers, target_qty)
-            before_pairs = _tiers_pairs(ev.tiers)
-            desired_pairs = _tiers_pairs(desired)
-            identical = before_pairs == desired_pairs
+            # --- NEW: if totals already match, do nothing (no POST, no Teams) ---
+            current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
+            if current_total == target_qty:
+                before_pairs = _tiers_pairs(ev.tiers)
+                desired = ev.tiers  # leave tiers as-is
+                desired_pairs = before_pairs
+                identical = True
+                if debug:
+                    client._log(debug, f"[SKIP] event_id={ev.event_id} — totals already match ({current_total}); no rebalance.")
+            else:
+                # Allocate using controller's quantity (not offsets)
+                desired = _alloc_inventory(ev.tiers, target_qty)
+                before_pairs = _tiers_pairs(ev.tiers)
+                desired_pairs = _tiers_pairs(desired)
+                identical = before_pairs == desired_pairs
 
             if debug:
                 client._log(debug,

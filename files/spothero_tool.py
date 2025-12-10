@@ -371,6 +371,9 @@ def _tiers_pairs(tiers: List[Dict[str, Any]]) -> List[Tuple[int, int, int]]:
 
 
 def _alloc_inventory(tiers: List[Dict[str, Any]], total_qty: int) -> List[Dict[str, Any]]:
+    """
+    Legacy round-robin allocator (kept for reference/backward-compat).
+    """
     out = [{"price": int(t["price"]), "order": int(t["order"]), "inventory": 0} for t in tiers]
     if total_qty <= 0 or not out:
         return out
@@ -381,6 +384,63 @@ def _alloc_inventory(tiers: List[Dict[str, Any]], total_qty: int) -> List[Dict[s
         remain -= 1
         i = (i + 1) % len(out)
     return out
+
+
+def _alloc_inventory_smart(
+    tiers: List[Dict[str, Any]],
+    target_qty: int,
+    current_tier_number: Optional[int]
+) -> List[Dict[str, Any]]:
+    """
+    Advanced allocator per business rules:
+      - If increasing (target > current_total): add ALL delta to the 'current tier'
+        from Upcoming Events API (current_tier.current_tier_number). We assume that
+        tier_number = order + 1. If not found or missing, fall back to lowest order.
+      - If decreasing (target < current_total): remove inventory from the highest
+        order downwards, draining each tier before moving up.
+    """
+    # Start from *current* tier inventories (no reset to zero)
+    desired = [{"price": int(t["price"]), "order": int(t["order"]), "inventory": int(t.get("inventory", 0))} for t in tiers]
+    if not desired:
+        return desired
+
+    # Normalize/sort by order for consistent behavior
+    desired.sort(key=lambda x: x["order"])
+
+    current_total = sum(int(t["inventory"]) for t in desired)
+    delta = int(target_qty) - int(current_total)
+
+    if delta == 0:
+        return desired  # unchanged
+
+    if delta > 0:
+        # Map the current_tier_number (1-based) to the tier with order == current_tier_number-1
+        idx = None
+        if isinstance(current_tier_number, int):
+            for i, t in enumerate(desired):
+                if int(t["order"]) == int(current_tier_number) - 1:
+                    idx = i
+                    break
+        # Fallback: if we can't find it, use the lowest order (index 0)
+        if idx is None:
+            idx = 0
+        desired[idx]["inventory"] = int(desired[idx]["inventory"]) + delta
+        return desired
+
+    # delta < 0 → we must remove |delta| from the tail (highest order first)
+    to_remove = -delta
+    # iterate descending order
+    for t in sorted(desired, key=lambda x: x["order"], reverse=True):
+        if to_remove <= 0:
+            break
+        have = int(t["inventory"])
+        if have <= 0:
+            continue
+        take = min(have, to_remove)
+        t["inventory"] = have - take
+        to_remove -= take
+
+    return desired
 
 
 def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
@@ -770,7 +830,7 @@ def run_update_for_facility_all_rules(
 
             considered_count += 1
 
-            # --- NEW: if totals already match, do nothing (no POST, no Teams) ---
+            # --- If totals already match, do nothing (no POST, no Teams) ---
             current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
             if current_total == target_qty:
                 before_pairs = _tiers_pairs(ev.tiers)
@@ -780,8 +840,14 @@ def run_update_for_facility_all_rules(
                 if debug:
                     client._log(debug, f"[SKIP] event_id={ev.event_id} — totals already match ({current_total}); no rebalance.")
             else:
-                # Allocate using controller's quantity (not offsets)
-                desired = _alloc_inventory(ev.tiers, target_qty)
+                # --- NEW smart allocation rules ---
+                current_tier_number = None
+                try:
+                    current_tier_number = int((ev.raw.get("current_tier") or {}).get("current_tier_number"))
+                except Exception:
+                    current_tier_number = None
+
+                desired = _alloc_inventory_smart(ev.tiers, target_qty, current_tier_number)
                 before_pairs = _tiers_pairs(ev.tiers)
                 desired_pairs = _tiers_pairs(desired)
                 identical = before_pairs == desired_pairs

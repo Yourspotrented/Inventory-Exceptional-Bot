@@ -20,6 +20,11 @@ TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
 TEAMS_NOTIFY_DRY_RUN = (os.getenv("TEAMS_NOTIFY_DRY_RUN", "false").lower() in {"1", "true", "yes"})
 # Enforce updates only when an inventory *exception* rule is active
 ENFORCE_ONLY_IF_INVENTORY_EXCEPTION = (os.getenv("ENFORCE_ONLY_IF_INVENTORY_EXCEPTION", "true").lower() in {"1", "true", "yes"})
+# NEW: summary/per-event controls
+TEAMS_RULE_SUMMARY_ENABLED = (os.getenv("TEAMS_RULE_SUMMARY_ENABLED", "true").lower() in {"1", "true", "yes"})
+TEAMS_PER_EVENT_NOTIFICATIONS = (os.getenv("TEAMS_PER_EVENT_NOTIFICATIONS", "false").lower() in {"1", "true", "yes"})
+# NEW: gate summaries unless there were changes (default true)
+TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE = (os.getenv("TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes"})
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -35,8 +40,8 @@ class InventoryRule:
 class EventInfo:
     event_id: int
     rule_id: Optional[int]
-    event_starts_local: Optional[dt.datetime]  # tz-aware in America/Chicago
-    event_ends_local: Optional[dt.datetime]    # tz-aware in America/Chicago
+    event_starts_local: Optional[dt.datetime]
+    event_ends_local: Optional[dt.datetime]
     starts_offset: str
     ends_offset: str
     tiers: List[Dict[str, Any]]
@@ -125,10 +130,7 @@ class SpotHeroClient:
                 d = data.get("data") or data
                 name = d.get("name") or d.get("title") or d.get("display_name") or ""
                 title = d.get("title") or d.get("name") or ""
-                return {
-                    "name": str(name) if name else "",
-                    "title": str(title) if title else "",
-                }
+                return {"name": str(name) if name else "", "title": str(title) if title else ""}
         except Exception:
             pass
         return {}
@@ -331,15 +333,11 @@ class SpotHeroClient:
 
 # ---------- Helpers (LOCAL parsing & logic) ----------
 def _parse_event_local(ev: Dict[str, Any], tz_name: str) -> EventInfo:
-    """
-    Use ONLY the event's own start/end (no reservation/offset shift).
-    """
     tz = ZoneInfo(tz_name)
     tiers = ev.get("tiers") or []
     start_off = ev.get("event_starts_offset_display") or ev.get("event_starts_offset") or "00:00"
     end_off = ev.get("event_ends_offset_display") or ev.get("event_ends_offset") or "00:00"
 
-    # Strictly use event times (not reservation_*). This avoids offset-based windows.
     e_starts_s = ev.get("event_starts")
     e_ends_s   = ev.get("event_ends")
 
@@ -371,9 +369,6 @@ def _tiers_pairs(tiers: List[Dict[str, Any]]) -> List[Tuple[int, int, int]]:
 
 
 def _alloc_inventory(tiers: List[Dict[str, Any]], total_qty: int) -> List[Dict[str, Any]]:
-    """
-    Legacy round-robin allocator (kept for reference/backward-compat).
-    """
     out = [{"price": int(t["price"]), "order": int(t["order"]), "inventory": 0} for t in tiers]
     if total_qty <= 0 or not out:
         return out
@@ -391,45 +386,31 @@ def _alloc_inventory_smart(
     target_qty: int,
     current_tier_number: Optional[int]
 ) -> List[Dict[str, Any]]:
-    """
-    Advanced allocator per business rules:
-      - If increasing (target > current_total): add ALL delta to the 'current tier'
-        from Upcoming Events API (current_tier.current_tier_number). We assume that
-        tier_number = order + 1. If not found or missing, fall back to lowest order.
-      - If decreasing (target < current_total): remove inventory from the highest
-        order downwards, draining each tier before moving up.
-    """
-    # Start from *current* tier inventories (no reset to zero)
     desired = [{"price": int(t["price"]), "order": int(t["order"]), "inventory": int(t.get("inventory", 0))} for t in tiers]
     if not desired:
         return desired
 
-    # Normalize/sort by order for consistent behavior
     desired.sort(key=lambda x: x["order"])
 
     current_total = sum(int(t["inventory"]) for t in desired)
     delta = int(target_qty) - int(current_total)
 
     if delta == 0:
-        return desired  # unchanged
+        return desired
 
     if delta > 0:
-        # Map the current_tier_number (1-based) to the tier with order == current_tier_number-1
         idx = None
         if isinstance(current_tier_number, int):
             for i, t in enumerate(desired):
                 if int(t["order"]) == int(current_tier_number) - 1:
                     idx = i
                     break
-        # Fallback: if we can't find it, use the lowest order (index 0)
         if idx is None:
             idx = 0
         desired[idx]["inventory"] = int(desired[idx]["inventory"]) + delta
         return desired
 
-    # delta < 0 → we must remove |delta| from the tail (highest order first)
     to_remove = -delta
-    # iterate descending order
     for t in sorted(desired, key=lambda x: x["order"], reverse=True):
         if to_remove <= 0:
             break
@@ -444,7 +425,6 @@ def _alloc_inventory_smart(
 
 
 def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
-    # kept for compatibility (overlap semantics); not used for decisions anymore
     if not ev.event_starts_local or not ev.event_ends_local:
         return False, "missing start/end"
     if ev.event_ends_local <= win_from_local:
@@ -455,7 +435,6 @@ def _event_within_local(ev: EventInfo, win_from_local: dt.datetime, win_to_local
 
 
 def _event_contained_in(ev: EventInfo, win_from_local: dt.datetime, win_to_local: dt.datetime) -> Tuple[bool, str]:
-    # require full containment: rule window must fully contain the event window
     if not ev.event_starts_local or not ev.event_ends_local:
         return False, "missing start/end"
     if ev.event_starts_local < win_from_local:
@@ -490,13 +469,6 @@ def _is_rule_exception(raw: Dict[str, Any]) -> bool:
 
 
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
-    """
-    Among rules that FULLY CONTAIN the event and are exceptions, pick controller:
-      1) Prefer exact time match.
-      2) Else choose minimal quantity.
-      3) Tie-break by largest overlap minutes, then latest valid_from.
-    Returns (target_qty, controller_rule) or (None, None) if none contain.
-    """
     contenders: List[Tuple[InventoryRule, int, bool]] = []
     for r in rules:
         if not _is_rule_exception(r.raw):
@@ -533,8 +505,7 @@ def _post_teams_card(card: Dict[str, Any]) -> None:
                 "contentType": "application/vnd.microsoft.card.adaptive",
                 "contentUrl": None,
                 "content": card
-            }]
-        }
+            }]}
         requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=10)
     except Exception:
         pass
@@ -666,7 +637,6 @@ def _build_change_card(
                             {"title": "Event End",   "value": _fmt_local(event.event_ends_local)},
                             {"title": "Event ID",    "value": f"#{event.event_id}"},
                             {"title": "Applied", "value": "true" if applied else ("false" if applied is not None else "n/a")},
-                            
                         ],
                     },
                 ],
@@ -685,7 +655,6 @@ def _build_change_card(
             {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}
         ],
     }
-
     return card
 
 
@@ -720,16 +689,138 @@ def _build_exception_card(
             {"type": "TextBlock", "text": (f"Event #{event.event_id}" if event else "Event: n/a"), "isSubtle": True, "wrap": True},
         ],
         "actions": [
-            {
-                "type": "ActionSet",
-                "actions": [
-                    { "type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator" }
-                ]
-            }
+            {"type": "ActionSet","actions":[{"type":"Action.OpenUrl","title":"Open SpotHero","url":"https://spothero.com/operator"}]}
         ],
         "style": "attention"
     }
 
+# NEW: One-card-per-rule summary
+def _build_rule_events_card(
+    *,
+    facility_id: int,
+    facility_name: str,
+    facility_title: str,
+    tz_name: str,
+    rule_from: dt.datetime,
+    rule_to: dt.datetime,
+    rule_qty: int,
+    events: List[Dict[str, Any]],
+    old_total: int,
+    new_total: int,
+) -> Dict[str, Any]:
+    events_sorted = sorted(events, key=lambda e: (e.get("start") or ""))
+    MAX_ROWS = 50
+    shown = events_sorted[:MAX_ROWS]
+    hidden_count = max(0, len(events_sorted) - len(shown))
+
+    def row(idx: int, e: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "columns": [
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": str(idx), "isSubtle": True}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": f"#{e['id']}"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": e.get("start_fmt", "—"), "wrap": True}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": e.get("end_fmt", "—"), "wrap": True}]},
+            ]
+        }
+
+    body_rows: List[Dict[str, Any]] = [
+        {"type": "TextBlock", "text": "Events in Window", "weight": "Bolder", "size": "Medium"},
+        {
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "separator": True,
+            "columns": [
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "#", "weight": "Bolder"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "Event ID", "weight": "Bolder"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Event Start", "weight": "Bolder"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Event End", "weight": "Bolder"}]},
+            ],
+        },
+    ]
+    for i, e in enumerate(shown, start=1):
+        body_rows.append(row(i, e))
+    if hidden_count:
+        body_rows.append({"type": "TextBlock", "text": f"+{hidden_count} more not shown", "isSubtle": True})
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": [
+                    {"type": "TextBlock", "text": "Inventory Update — Rule Summary", "weight": "Bolder", "size": "Large"},
+                    {"type": "TextBlock", "text": "SpotHero Inventory Bot", "isSubtle": True, "spacing": "None"},
+                ],
+            },
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock", "text": "Summary", "weight": "Bolder", "size": "Medium"},
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "items": [
+                                    {"type": "TextBlock", "text": "Old Inventory", "isSubtle": True},
+                                    {"type": "TextBlock", "text": str(old_total), "weight": "Bolder", "size": "Medium"},
+                                ],
+                            },
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "items": [
+                                    {"type": "TextBlock", "text": "New Inventory", "isSubtle": True},
+                                    {"type": "TextBlock", "text": str(new_total), "weight": "Bolder", "size": "Medium"},
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
+                            {"title": "Facility ID", "value": str(facility_id)},
+                            {"title": "Rule From", "value": f"{_fmt_local(rule_from)} ({tz_name})"},
+                            {"title": "Rule To",   "value": f"{_fmt_local(rule_to)} ({tz_name})"},
+                            {"title": "Rule Qty",  "value": str(rule_qty)},
+                            {"title": "Events Count", "value": str(len(events))},
+                        ],
+                    },
+                ],
+            },
+            {"type": "Container","spacing":"Medium","items": body_rows},
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock",
+                     "text": "Posted by Flow bot • Values are local to America/Chicago",
+                     "isSubtle": True, "size": "Small"}
+                ],
+            },
+        ],
+        "actions": [
+            {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}
+        ],
+    }
 
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
@@ -753,12 +844,7 @@ def run_update_for_facility_all_rules(
 
     client._log(debug, f"[rules] found {len(rules)}")
     for r in (rules if debug else []):
-        client._log(debug,
-            "   - rule",
-            "| qty=", r.quantity,
-            "| valid_from_local=", r.valid_from_local,
-            "| valid_to_local=", r.valid_to_local
-        )
+        client._log(debug, "   - rule", "| qty=", r.quantity, "| valid_from_local=", r.valid_from_local, "| valid_to_local=", r.valid_to_local)
 
     vf_list = [r.valid_from_local.date() for r in rules]
     vt_list = [r.valid_to_local.date() for r in rules]
@@ -805,21 +891,23 @@ def run_update_for_facility_all_rules(
         matched: List[Dict[str, Any]] = []
         considered_count = 0
         non_contain_debug: List[str] = []
+        events_for_rule: List[Dict[str, Any]] = []
+
+        rule_old_total = 0
+        rule_new_total = 0
+        changed_events_count = 0  # NEW: track if anything changed under this rule
 
         for ev in all_events:
-            # Require full containment of the event within the rule window (not overlap)
             ok, why = _event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)
             if not ok:
                 if debug and len(non_contain_debug) < 10:
                     non_contain_debug.append(f"event {ev.event_id}: {why}")
                 continue
 
-            # Must be exception when guard is enabled
             if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not rule_is_exception:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — rule is not an exception.")
                 continue
 
-            # Determine the *controller* among all containing exception rules
             target_qty, controller = _containing_controller(rules, ev)
             if controller is None:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — no containing exception found.")
@@ -830,17 +918,25 @@ def run_update_for_facility_all_rules(
 
             considered_count += 1
 
-            # --- If totals already match, do nothing (no POST, no Teams) ---
+            events_for_rule.append({
+                "id": ev.event_id,
+                "start": ev.event_starts_local.isoformat() if ev.event_starts_local else None,
+                "end": ev.event_ends_local.isoformat() if ev.event_ends_local else None,
+                "start_fmt": _fmt_local(ev.event_starts_local),
+                "end_fmt": _fmt_local(ev.event_ends_local),
+            })
+
             current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
             if current_total == target_qty:
                 before_pairs = _tiers_pairs(ev.tiers)
-                desired = ev.tiers  # leave tiers as-is
+                desired = ev.tiers
                 desired_pairs = before_pairs
                 identical = True
+                rule_old_total += sum(inv for _, _, inv in before_pairs)
+                rule_new_total += sum(inv for _, _, inv in desired_pairs)
                 if debug:
                     client._log(debug, f"[SKIP] event_id={ev.event_id} — totals already match ({current_total}); no rebalance.")
             else:
-                # --- NEW smart allocation rules ---
                 current_tier_number = None
                 try:
                     current_tier_number = int((ev.raw.get("current_tier") or {}).get("current_tier_number"))
@@ -850,7 +946,9 @@ def run_update_for_facility_all_rules(
                 desired = _alloc_inventory_smart(ev.tiers, target_qty, current_tier_number)
                 before_pairs = _tiers_pairs(ev.tiers)
                 desired_pairs = _tiers_pairs(desired)
-                identical = before_pairs == desired_pairs
+                identical = (before_pairs == desired_pairs)
+                rule_old_total += sum(inv for _, _, inv in before_pairs)
+                rule_new_total += sum(inv for _, _, inv in desired_pairs)
 
             if debug:
                 client._log(debug,
@@ -863,9 +961,9 @@ def run_update_for_facility_all_rules(
             applied: Optional[bool] = None
 
             if not identical:
+                changed_events_count += 1  # NEW: mark that this rule caused a change
                 client._log(debug, f"[POST] event_id={ev.event_id} qty={target_qty}")
                 try:
-                    # Offsets are *not* used for filtering; they are passed through as-is to satisfy API schema.
                     post_result = client.post_tiered_event_rating_rules(
                         facility_id=facility_id,
                         event_ids=[ev.event_id],
@@ -894,7 +992,7 @@ def run_update_for_facility_all_rules(
                         verify_after = _tiers_pairs(chk.tiers)
                         applied = (verify_after == desired_pairs)
                         client._log(debug, f"[VERIFY] event_id={ev.event_id} after={verify_after} applied={applied}")
-                        if applied:
+                        if applied and TEAMS_PER_EVENT_NOTIFICATIONS:
                             _post_teams_card(_build_change_card(
                                 facility_id=facility_id,
                                 facility_name=facility_name,
@@ -935,6 +1033,37 @@ def run_update_for_facility_all_rules(
                 "applied": applied,
             })
 
+        # NEW: Rule Summary card gated by actual changes (or override)
+        if (
+            TEAMS_RULE_SUMMARY_ENABLED
+            and TEAMS_WEBHOOK_URL
+            and rule_is_exception
+            and events_for_rule
+            and (not dry_run or TEAMS_NOTIFY_DRY_RUN)
+        ):
+            totals_changed = (rule_old_total != rule_new_total)
+            should_send = (changed_events_count > 0) or totals_changed or (not TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE)
+            if should_send:
+                try:
+                    _post_teams_card(_build_rule_events_card(
+                        facility_id=facility_id,
+                        facility_name=facility_name,
+                        facility_title=facility_title,
+                        tz_name=tz_name,
+                        rule_from=rule.valid_from_local,
+                        rule_to=rule.valid_to_local,
+                        rule_qty=rule.quantity,
+                        events=events_for_rule,
+                        old_total=rule_old_total,
+                        new_total=rule_new_total,
+                    ))
+                    client._log(debug, f"[TEAMS] sent rule summary card: events={len(events_for_rule)} "
+                                       f"| changed_events={changed_events_count} totals_changed={totals_changed}")
+                except Exception as e:
+                    client._log(debug, f"[TEAMS] failed to send rule summary: {e!r}")
+            else:
+                client._log(debug, "[TEAMS] rule summary suppressed (no changes).")
+
         client._log(debug, f"[rule] {from_date}→{to_date} qty={rule.quantity} | containing_events={considered_count}")
         if debug and non_contain_debug:
             client._log(debug, "   examples of non-containment reasons:")
@@ -948,6 +1077,8 @@ def run_update_for_facility_all_rules(
                 "from_date": f"{from_date:%Y-%m-%d}",
                 "to_date": f"{to_date:%Y-%m-%d}",
                 "quantity": rule.quantity,
+                "is_exception": rule_is_exception,
+                "events_in_window": len(events_for_rule),
             },
             "events_updated_or_skipped": matched,
         })

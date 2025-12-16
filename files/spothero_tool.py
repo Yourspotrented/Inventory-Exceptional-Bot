@@ -19,12 +19,16 @@ DEFAULT_TZ = "America/Chicago"
 TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL", "").strip()
 TEAMS_NOTIFY_DRY_RUN = (os.getenv("TEAMS_NOTIFY_DRY_RUN", "false").lower() in {"1", "true", "yes"})
 # Enforce updates only when an inventory *exception* rule is active
-ENFORCE_ONLY_IF_INVENTORY_EXCEPTION = (os.getenv("ENFORCE_ONLY_IF_INVENTORY_EXCEPTION", "true").lower() in {"1", "true", "yes"})
+ENFORCE_ONLY_IF_INVENTORY_EXCEPTION = (
+    os.getenv("ENFORCE_ONLY_IF_INVENTORY_EXCEPTION", "true").lower() in {"1", "true", "yes"}
+)
 # NEW: summary/per-event controls
 TEAMS_RULE_SUMMARY_ENABLED = (os.getenv("TEAMS_RULE_SUMMARY_ENABLED", "true").lower() in {"1", "true", "yes"})
 TEAMS_PER_EVENT_NOTIFICATIONS = (os.getenv("TEAMS_PER_EVENT_NOTIFICATIONS", "false").lower() in {"1", "true", "yes"})
 # NEW: gate summaries unless there were changes (default true)
-TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE = (os.getenv("TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes"})
+TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE = (
+    os.getenv("TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes"}
+)
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -199,13 +203,15 @@ class SpotHeroClient:
         if debug:
             meta = data.get("meta") or {}
             results = (data.get("data", {}) or {}).get("results", []) or []
-            self._log(debug,
+            self._log(
+                debug,
                 f"[upcoming-events] GET page={page} perPage={per_page} "
                 f"| meta.page={meta.get('page')} meta.pages={meta.get('pages')} meta.nextPage={meta.get('nextPage')} "
                 f"| returned={len(results)}"
             )
             for row in results[:5]:
-                self._log(debug,
+                self._log(
+                    debug,
                     "    sample:",
                     "event_id=", row.get("event_id"),
                     "rule_id=", row.get("rule_id"),
@@ -339,7 +345,7 @@ def _parse_event_local(ev: Dict[str, Any], tz_name: str) -> EventInfo:
     end_off = ev.get("event_ends_offset_display") or ev.get("event_ends_offset") or "00:00"
 
     e_starts_s = ev.get("event_starts")
-    e_ends_s   = ev.get("event_ends")
+    e_ends_s = ev.get("event_ends")
 
     def parse_local(s: Optional[str]) -> Optional[dt.datetime]:
         if not s:
@@ -689,12 +695,13 @@ def _build_exception_card(
             {"type": "TextBlock", "text": (f"Event #{event.event_id}" if event else "Event: n/a"), "isSubtle": True, "wrap": True},
         ],
         "actions": [
-            {"type": "ActionSet","actions":[{"type":"Action.OpenUrl","title":"Open SpotHero","url":"https://spothero.com/operator"}]}
+            {"type": "ActionSet", "actions": [{"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}]}
         ],
         "style": "attention"
     }
 
-# NEW: One-card-per-rule summary
+
+# NEW: One-card-per-rule summary (PER-EVENT OLD/NEW INVENTORY)
 def _build_rule_events_card(
     *,
     facility_id: int,
@@ -705,8 +712,7 @@ def _build_rule_events_card(
     rule_to: dt.datetime,
     rule_qty: int,
     events: List[Dict[str, Any]],
-    old_total: int,
-    new_total: int,
+    changed_events_count: int,
 ) -> Dict[str, Any]:
     events_sorted = sorted(events, key=lambda e: (e.get("start") or ""))
     MAX_ROWS = 50
@@ -726,6 +732,10 @@ def _build_rule_events_card(
                  "items": [{"type": "TextBlock", "text": e.get("start_fmt", "—"), "wrap": True}]},
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": e.get("end_fmt", "—"), "wrap": True}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": str(e.get("old_inv", "—"))}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": str(e.get("new_inv", "—"))}]},
             ]
         }
 
@@ -744,11 +754,17 @@ def _build_rule_events_card(
                  "items": [{"type": "TextBlock", "text": "Event Start", "weight": "Bolder"}]},
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": "Event End", "weight": "Bolder"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "Old Inv", "weight": "Bolder"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "New Inv", "weight": "Bolder"}]},
             ],
         },
     ]
+
     for i, e in enumerate(shown, start=1):
         body_rows.append(row(i, e))
+
     if hidden_count:
         body_rows.append({"type": "TextBlock", "text": f"+{hidden_count} more not shown", "isSubtle": True})
 
@@ -773,40 +789,20 @@ def _build_rule_events_card(
                 "items": [
                     {"type": "TextBlock", "text": "Summary", "weight": "Bolder", "size": "Medium"},
                     {
-                        "type": "ColumnSet",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "items": [
-                                    {"type": "TextBlock", "text": "Old Inventory", "isSubtle": True},
-                                    {"type": "TextBlock", "text": str(old_total), "weight": "Bolder", "size": "Medium"},
-                                ],
-                            },
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "items": [
-                                    {"type": "TextBlock", "text": "New Inventory", "isSubtle": True},
-                                    {"type": "TextBlock", "text": str(new_total), "weight": "Bolder", "size": "Medium"},
-                                ],
-                            },
-                        ],
-                    },
-                    {
                         "type": "FactSet",
                         "facts": [
                             {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
                             {"title": "Facility ID", "value": str(facility_id)},
                             {"title": "Rule From", "value": f"{_fmt_local(rule_from)} ({tz_name})"},
                             {"title": "Rule To",   "value": f"{_fmt_local(rule_to)} ({tz_name})"},
-                            {"title": "Rule Qty",  "value": str(rule_qty)},
+                            {"title": "Rule Qty (target)", "value": str(rule_qty)},
                             {"title": "Events Count", "value": str(len(events))},
+                            {"title": "Events Needing Change", "value": str(changed_events_count)},
                         ],
                     },
                 ],
             },
-            {"type": "Container","spacing":"Medium","items": body_rows},
+            {"type": "Container", "spacing": "Medium", "items": body_rows},
             {
                 "type": "Container",
                 "spacing": "Medium",
@@ -821,6 +817,7 @@ def _build_rule_events_card(
             {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}
         ],
     }
+
 
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
@@ -893,9 +890,7 @@ def run_update_for_facility_all_rules(
         non_contain_debug: List[str] = []
         events_for_rule: List[Dict[str, Any]] = []
 
-        rule_old_total = 0
-        rule_new_total = 0
-        changed_events_count = 0  # NEW: track if anything changed under this rule
+        changed_events_count = 0  # track actual changes (POST needed)
 
         for ev in all_events:
             ok, why = _event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)
@@ -918,22 +913,25 @@ def run_update_for_facility_all_rules(
 
             considered_count += 1
 
+            # IMPORTANT: old_inv must come from upcoming-events tier inventories for THIS event
+            current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
+
+            # Store per-event row data for Teams summary card (per-event old/new)
             events_for_rule.append({
                 "id": ev.event_id,
                 "start": ev.event_starts_local.isoformat() if ev.event_starts_local else None,
                 "end": ev.event_ends_local.isoformat() if ev.event_ends_local else None,
                 "start_fmt": _fmt_local(ev.event_starts_local),
                 "end_fmt": _fmt_local(ev.event_ends_local),
+                "old_inv": int(current_total),
+                "new_inv": int(target_qty),
             })
 
-            current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
             if current_total == target_qty:
                 before_pairs = _tiers_pairs(ev.tiers)
                 desired = ev.tiers
                 desired_pairs = before_pairs
                 identical = True
-                rule_old_total += sum(inv for _, _, inv in before_pairs)
-                rule_new_total += sum(inv for _, _, inv in desired_pairs)
                 if debug:
                     client._log(debug, f"[SKIP] event_id={ev.event_id} — totals already match ({current_total}); no rebalance.")
             else:
@@ -947,11 +945,10 @@ def run_update_for_facility_all_rules(
                 before_pairs = _tiers_pairs(ev.tiers)
                 desired_pairs = _tiers_pairs(desired)
                 identical = (before_pairs == desired_pairs)
-                rule_old_total += sum(inv for _, _, inv in before_pairs)
-                rule_new_total += sum(inv for _, _, inv in desired_pairs)
 
             if debug:
-                client._log(debug,
+                client._log(
+                    debug,
                     f"[decision] event_id={ev.event_id} controller_qty={target_qty} "
                     f"before={before_pairs} desired={desired_pairs} identical={identical}"
                 )
@@ -961,7 +958,7 @@ def run_update_for_facility_all_rules(
             applied: Optional[bool] = None
 
             if not identical:
-                changed_events_count += 1  # NEW: mark that this rule caused a change
+                changed_events_count += 1
                 client._log(debug, f"[POST] event_id={ev.event_id} qty={target_qty}")
                 try:
                     post_result = client.post_tiered_event_rating_rules(
@@ -1033,7 +1030,7 @@ def run_update_for_facility_all_rules(
                 "applied": applied,
             })
 
-        # NEW: Rule Summary card gated by actual changes (or override)
+        # Rule Summary card: send ONLY when changes happened (unless override)
         if (
             TEAMS_RULE_SUMMARY_ENABLED
             and TEAMS_WEBHOOK_URL
@@ -1041,8 +1038,7 @@ def run_update_for_facility_all_rules(
             and events_for_rule
             and (not dry_run or TEAMS_NOTIFY_DRY_RUN)
         ):
-            totals_changed = (rule_old_total != rule_new_total)
-            should_send = (changed_events_count > 0) or totals_changed or (not TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE)
+            should_send = (changed_events_count > 0) or (not TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE)
             if should_send:
                 try:
                     _post_teams_card(_build_rule_events_card(
@@ -1054,11 +1050,10 @@ def run_update_for_facility_all_rules(
                         rule_to=rule.valid_to_local,
                         rule_qty=rule.quantity,
                         events=events_for_rule,
-                        old_total=rule_old_total,
-                        new_total=rule_new_total,
+                        changed_events_count=changed_events_count,
                     ))
                     client._log(debug, f"[TEAMS] sent rule summary card: events={len(events_for_rule)} "
-                                       f"| changed_events={changed_events_count} totals_changed={totals_changed}")
+                                       f"| changed_events={changed_events_count}")
                 except Exception as e:
                     client._log(debug, f"[TEAMS] failed to send rule summary: {e!r}")
             else:

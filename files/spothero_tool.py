@@ -719,23 +719,32 @@ def _build_rule_events_card(
     shown = events_sorted[:MAX_ROWS]
     hidden_count = max(0, len(events_sorted) - len(shown))
 
+    def _num_cell(v: Any) -> Dict[str, Any]:
+        return {"type": "TextBlock", "text": str(v), "horizontalAlignment": "Right"}
+
     def row(idx: int, e: Dict[str, Any]) -> Dict[str, Any]:
+        # keep column ORDER identical to header
         return {
             "type": "ColumnSet",
             "spacing": "Small",
             "columns": [
                 {"type": "Column", "width": "auto",
                  "items": [{"type": "TextBlock", "text": str(idx), "isSubtle": True}]},
+
                 {"type": "Column", "width": "auto",
                  "items": [{"type": "TextBlock", "text": f"#{e['id']}"}]},
+
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": e.get("start_fmt", "—"), "wrap": True}]},
+
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": e.get("end_fmt", "—"), "wrap": True}]},
+
                 {"type": "Column", "width": "auto",
-                 "items": [{"type": "TextBlock", "text": str(e.get("old_inv", "—"))}]},
+                 "items": [_num_cell(e.get("old_inv", "—"))]},
+
                 {"type": "Column", "width": "auto",
-                 "items": [{"type": "TextBlock", "text": str(e.get("new_inv", "—"))}]},
+                 "items": [_num_cell(e.get("new_inv", "—"))]},
             ]
         }
 
@@ -748,16 +757,22 @@ def _build_rule_events_card(
             "columns": [
                 {"type": "Column", "width": "auto",
                  "items": [{"type": "TextBlock", "text": "#", "weight": "Bolder"}]},
+
                 {"type": "Column", "width": "auto",
                  "items": [{"type": "TextBlock", "text": "Event ID", "weight": "Bolder"}]},
+
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": "Event Start", "weight": "Bolder"}]},
+
                 {"type": "Column", "width": "stretch",
                  "items": [{"type": "TextBlock", "text": "Event End", "weight": "Bolder"}]},
+
+                # keep column ORDER identical to row()
                 {"type": "Column", "width": "auto",
-                 "items": [{"type": "TextBlock", "text": "Old Inv", "weight": "Bolder"}]},
+                 "items": [{"type": "TextBlock", "text": "Old Inventory", "weight": "Bolder", "horizontalAlignment": "Right"}]},
+
                 {"type": "Column", "width": "auto",
-                 "items": [{"type": "TextBlock", "text": "New Inv", "weight": "Bolder"}]},
+                 "items": [{"type": "TextBlock", "text": "New Inventory", "weight": "Bolder", "horizontalAlignment": "Right"}]},
             ],
         },
     ]
@@ -817,7 +832,6 @@ def _build_rule_events_card(
             {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"}
         ],
     }
-
 
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(

@@ -556,6 +556,7 @@ def _tier_row(order: int, price: int, inv_old: int, inv_new: int) -> Dict[str, A
     }
 
 
+
 def _build_change_card(
     *,
     facility_id: int,
@@ -586,6 +587,67 @@ def _build_change_card(
         "Inventory Update — Applied"
     )
 
+    # Build a tiers table if we have data
+    def _tiers_table() -> Optional[Dict[str, Any]]:
+        if not before_pairs or not desired_pairs:
+            return None
+
+        # Build quick lookup for old/new/after by tier order
+        old_by_tier = {o: (p, inv) for o, p, inv in before_pairs}
+        new_by_tier = {o: (p, inv) for o, p, inv in desired_pairs}
+        after_by_tier = {o: (p, inv) for o, p, inv in (after_pairs or [])}
+
+        # Use union of tiers so we never drop a row
+        tier_orders = sorted(set(old_by_tier) | set(new_by_tier) | set(after_by_tier))
+
+        header_cells = [
+            {"type": "TableCell", "items": [{"type": "TextBlock", "text": "Tier", "weight": "Bolder"}]},
+            {"type": "TableCell", "items": [{"type": "TextBlock", "text": "Price", "weight": "Bolder"}]},
+            {"type": "TableCell", "items": [{"type": "TextBlock", "text": "Old Inv.", "weight": "Bolder", "horizontalAlignment": "Right"}]},
+            {"type": "TableCell", "items": [{"type": "TextBlock", "text": "New Inv.", "weight": "Bolder", "horizontalAlignment": "Right"}]},
+        ]
+
+        include_after = bool(after_pairs)
+        if include_after:
+            header_cells.append(
+                {"type": "TableCell", "items": [{"type": "TextBlock", "text": "After", "weight": "Bolder", "horizontalAlignment": "Right"}]}
+            )
+
+        rows = [{
+            "type": "TableRow",
+            "cells": header_cells
+        }]
+
+        for order in tier_orders:
+            price = (new_by_tier.get(order) or old_by_tier.get(order) or after_by_tier.get(order) or (0, 0))[0]
+            old_inv = (old_by_tier.get(order) or (price, 0))[1]
+            new_inv = (new_by_tier.get(order) or (price, 0))[1]
+            cells = [
+                {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(order)}]},
+                {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"${price}"}]},
+                {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(old_inv), "horizontalAlignment": "Right"}]},
+                {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(new_inv), "horizontalAlignment": "Right"}]},
+            ]
+            if include_after:
+                after_inv = (after_by_tier.get(order) or (price, 0))[1]
+                cells.append({"type": "TableCell", "items": [{"type": "TextBlock", "text": str(after_inv), "horizontalAlignment": "Right"}]})
+            rows.append({"type": "TableRow", "cells": cells})
+
+        return {
+            "type": "Table",
+            "firstRowAsHeader": True,
+            "gridStyle": "default",
+            "columns": [
+                {"width": "auto"},
+                {"width": "auto"},
+                {"width": "auto"},
+                {"width": "auto"},
+            ] + ([{"width": "auto"}] if include_after else []),
+            "rows": rows,
+        }
+
+    tiers_table = _tiers_table()
+
     card: Dict[str, Any] = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
@@ -609,20 +671,14 @@ def _build_change_card(
                     {
                         "type": "ColumnSet",
                         "columns": [
-                            {
-                                "type": "Column", "width": "stretch",
-                                "items": [
-                                    {"type": "TextBlock", "text": "Old Inventory", "isSubtle": True},
-                                    {"type": "TextBlock", "text": str(old_total), "weight": "Bolder", "size": "Medium"},
-                                ],
-                            },
-                            {
-                                "type": "Column", "width": "stretch",
-                                "items": [
-                                    {"type": "TextBlock", "text": "New Inventory", "isSubtle": True},
-                                    {"type": "TextBlock", "text": str(new_total), "weight": "Bolder", "size": "Medium"},
-                                ],
-                            },
+                            {"type": "Column", "width": "stretch", "items": [
+                                {"type": "TextBlock", "text": "Old Inventory", "isSubtle": True},
+                                {"type": "TextBlock", "text": str(old_total), "weight": "Bolder", "size": "Large"},
+                            ]},
+                            {"type": "Column", "width": "stretch", "items": [
+                                {"type": "TextBlock", "text": "New Inventory", "isSubtle": True},
+                                {"type": "TextBlock", "text": str(new_total), "weight": "Bolder", "size": "Large"},
+                            ]},
                         ],
                     },
                 ],
@@ -632,21 +688,24 @@ def _build_change_card(
                 "spacing": "Medium",
                 "items": [
                     {"type": "TextBlock", "text": "Details", "weight": "Bolder", "size": "Medium"},
-                    {
-                        "type": "FactSet",
-                        "facts": [
-                            {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
-                            {"title": "Facility ID", "value": str(facility_id)},
-                            {"title": "Rule From", "value": f"{_fmt_local(rule_from)} ({tz_name})"},
-                            {"title": "Rule To",   "value": f"{_fmt_local(rule_to)} ({tz_name})"},
-                            {"title": "Event Start", "value": _fmt_local(event.event_starts_local)},
-                            {"title": "Event End",   "value": _fmt_local(event.event_ends_local)},
-                            {"title": "Event ID",    "value": f"#{event.event_id}"},
-                            {"title": "Applied", "value": "true" if applied else ("false" if applied is not None else "n/a")},
-                        ],
-                    },
+                    {"type": "FactSet", "facts": [
+                        {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
+                        {"title": "Facility ID", "value": str(facility_id)},
+                        {"title": "Rule From", "value": f"{_fmt_local(rule_from)} ({tz_name})"},
+                        {"title": "Rule To", "value": f"{_fmt_local(rule_to)} ({tz_name})"},
+                        {"title": "Event Start", "value": _fmt_local(event.event_starts_local)},
+                        {"title": "Event End", "value": _fmt_local(event.event_ends_local)},
+                        {"title": "Event ID", "value": f"#{event.event_id}"},
+                        {"title": "Applied", "value": "true" if applied else ("false" if applied is not None else "n/a")},
+                    ]},
                 ],
             },
+        ] + (
+            [{"type": "Container", "spacing": "Medium", "items": [
+                {"type": "TextBlock", "text": "Tier Allocation", "weight": "Bolder", "size": "Medium"},
+                tiers_table
+            ]}] if tiers_table else []
+        ) + [
             {
                 "type": "Container",
                 "spacing": "Medium",
@@ -662,6 +721,8 @@ def _build_change_card(
         ],
     }
     return card
+
+
 
 
 def _build_exception_card(

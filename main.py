@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 import httpx
@@ -64,7 +66,7 @@ class Settings(BaseModel):
 
     # --- ParkWhiz Gmail reservation flow (separate from SH updater) ---
     PARKWHIZ_ENABLED: bool = (os.getenv("PARKWHIZ_ENABLED", "false").lower() in {"1", "true", "yes"})
-    PARKWHIZ_POLL_INTERVAL_SECONDS: int = int(os.getenv("PARKWHIZ_POLL_INTERVAL_SECONDS", "30"))
+    PARKWHIZ_POLL_INTERVAL_SECONDS: int = int(os.getenv("PARKWHIZ_POLL_INTERVAL_SECONDS", "10"))
     PARKWHIZ_DRY_RUN: bool = (os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"})
     PARKWHIZ_DEBUG: bool = (os.getenv("PARKWHIZ_DEBUG", "false").lower() in {"1", "true", "yes"})
     GMAIL_AUTH_MODE: str = (os.getenv("GMAIL_AUTH_MODE") or "oauth").strip().lower()
@@ -207,6 +209,7 @@ class TokenManager:
         return {"flex_auth": flex, "reservation_auth": reservation}
 
 TOKEN_MGR = TokenManager()
+PARKWHIZ_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="parkwhiz")
 
 # ----------------------------- Facilities import ----------------------
 try:
@@ -433,17 +436,24 @@ async def parkwhiz_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
             if not flex:
                 raise RuntimeError("ParkWhiz: missing flex_auth")
 
-            items = await load_facilities_cache(app, force=False)
+            # Fast path: use in-memory facilities cache (no network wait during SH batch)
+            items = list(getattr(app.state, "facilities", None) or [])
+            if not items:
+                items = await load_facilities_cache(app, force=False)
 
-            results = await asyncio.to_thread(
-                run_parkwhiz_poll,
-                gmail=gmail,
-                query=settings.GMAIL_QUERY,
-                auth_token=flex,
-                facilities=items,
-                tz_name=settings.SH_UPDATE_TZ,
-                dry_run=settings.PARKWHIZ_DRY_RUN,
-                debug=settings.PARKWHIZ_DEBUG,
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                PARKWHIZ_EXECUTOR,
+                functools.partial(
+                    run_parkwhiz_poll,
+                    gmail=gmail,
+                    query=settings.GMAIL_QUERY,
+                    auth_token=flex,
+                    facilities=items,
+                    tz_name=settings.SH_UPDATE_TZ,
+                    dry_run=settings.PARKWHIZ_DRY_RUN,
+                    debug=settings.PARKWHIZ_DEBUG,
+                ),
             )
             if results:
                 applied = sum(1 for r in results if r.inventory_applied)
@@ -489,6 +499,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         app.state.stop_evt.set()
+        PARKWHIZ_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         for t in tasks:
             with contextlib.suppress(Exception):
                 await t

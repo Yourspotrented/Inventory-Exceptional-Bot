@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,6 +37,7 @@ PARKWHIZ_TEAMS_WEBHOOK_URL = os.getenv("PARKWHIZ_TEAMS_WEBHOOK_URL", "").strip()
 PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUTES", "20"))
 PARKWHIZ_STATE_FILE = os.getenv("PARKWHIZ_STATE_FILE", os.path.join("files", "parkwhiz_processed.json"))
 PARKWHIZ_DRY_RUN = os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"}
+PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "3")))
 
 
 @dataclass
@@ -60,8 +62,11 @@ class ProcessResult:
     facility_match: Optional[Dict[str, Any]] = None
     event_match: Optional[Dict[str, Any]] = None
     inventory_applied: bool = False
+    inventory_before: Optional[int] = None
+    inventory_after: Optional[int] = None
     inventory_skipped_reason: str = ""
     error: str = ""
+    processed_at: Optional[str] = None
 
 
 # ---------- Email parsing ----------
@@ -398,76 +403,228 @@ def _fmt_dt(ts: Optional[dt.datetime]) -> str:
     return ts.strftime("%a, %b %d %Y %I:%M %p %Z") if ts else "—"
 
 
+def _fmt_dt_short(ts: Optional[dt.datetime]) -> str:
+    return ts.strftime("%b %d · %I:%M %p") if ts else "—"
+
+
+def _sh_event_title(ev_raw: Optional[Dict[str, Any]], fallback: str = "") -> str:
+    if not ev_raw:
+        return fallback or "—"
+    for key in ("event_title", "title", "name", "event_name"):
+        val = ev_raw.get(key)
+        if val:
+            return str(val).strip()
+    nested = ev_raw.get("event") or ev_raw.get("canonical_event") or {}
+    if isinstance(nested, dict):
+        for key in ("title", "name", "event_title"):
+            val = nested.get(key)
+            if val:
+                return str(val).strip()
+    return fallback or "—"
+
+
+def _status_meta(result: ProcessResult) -> Dict[str, str]:
+    if result.inventory_applied:
+        return {"label": "Inventory Updated", "color": "Good", "icon": "✓"}
+    if result.inventory_skipped_reason == "time_parse_failed":
+        return {"label": "Review — Time Not Parsed", "color": "Warning", "icon": "!"}
+    if result.inventory_skipped_reason in {"facility_not_matched", "no_matching_event_in_tolerance"}:
+        return {"label": "Review — No SpotHero Match", "color": "Warning", "icon": "?"}
+    return {"label": "Review Required", "color": "Attention", "icon": "!"}
+
+
 def build_parkwhiz_review_card(
     *,
     result: ProcessResult,
     tz_name: str = DEFAULT_TZ,
 ) -> Dict[str, Any]:
     p = result.parsed
-    status = "Inventory Reduced" if result.inventory_applied else "Review Required"
-    if result.inventory_skipped_reason and not result.inventory_applied:
-        status = f"Review — {result.inventory_skipped_reason}"
-
-    accent = "Good" if result.inventory_applied else "Warning"
     fac = result.facility_match or {}
     ev = result.event_match or {}
+    ev_raw = ev.get("raw") or {}
+    status = _status_meta(result)
+    sh_event = _sh_event_title(ev_raw, p.event_title)
+    facility_id = str(fac.get("id") or "—")
+    event_id = str(ev.get("event_id") or "—")
 
-    facts = [
-        {"title": "Facility", "value": p.facility_name or "—"},
-        {"title": "Matched SpotHero", "value": fac.get("name") or "—"},
-        {"title": "SpotHero ID", "value": str(fac.get("id") or "—")},
-        {"title": "Confirmation #", "value": p.confirmation_number or "—"},
-        {"title": "Purchaser", "value": p.purchaser or "—"},
-        {"title": "Gross Price", "value": p.gross_price or "—"},
-        {"title": "Event", "value": p.event_title or "—"},
-        {"title": "Parsed Start", "value": _fmt_dt(p.reservation_start)},
-        {"title": "Parsed End", "value": _fmt_dt(p.reservation_end)},
-        {"title": "Raw Time Text", "value": p.raw_time_text or "—"},
-        {"title": "Time Parse OK", "value": "Yes" if p.parse_ok else "No"},
+    inv_before = result.inventory_before
+    inv_after = result.inventory_after
+    inv_changed = (
+        inv_before is not None
+        and inv_after is not None
+        and inv_before != inv_after
+    )
+
+    sh_window_start = ev.get("reservation_start") or "—"
+    sh_window_end = ev.get("reservation_end") or "—"
+    matched_via = ev.get("matched_window") or "event"
+
+    body: List[Dict[str, Any]] = [
+        {
+            "type": "Container",
+            "style": "emphasis",
+            "bleed": True,
+            "items": [
+                {
+                    "type": "ColumnSet",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {"type": "TextBlock", "text": "ParkWhiz → SpotHero", "weight": "Bolder", "size": "Large"},
+                                {"type": "TextBlock", "text": "Reservation sync · 2026", "isSubtle": True, "spacing": "None", "size": "Small"},
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "auto",
+                            "items": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": f"{status['icon']} {status['label']}",
+                                    "color": status["color"],
+                                    "weight": "Bolder",
+                                    "horizontalAlignment": "Right",
+                                    "wrap": True,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "type": "Container",
+            "spacing": "Medium",
+            "items": [
+                {"type": "TextBlock", "text": "Inventory Change (Control Panel)", "weight": "Bolder", "size": "Medium"},
+                {
+                    "type": "ColumnSet",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {"type": "TextBlock", "text": "Before", "isSubtle": True, "size": "Small"},
+                                {"type": "TextBlock", "text": str(inv_before if inv_before is not None else "—"), "size": "ExtraLarge", "weight": "Bolder"},
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "auto",
+                            "items": [{"type": "TextBlock", "text": "→", "size": "ExtraLarge", "horizontalAlignment": "Center"}],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {"type": "TextBlock", "text": "After", "isSubtle": True, "size": "Small"},
+                                {
+                                    "type": "TextBlock",
+                                    "text": str(inv_after if inv_after is not None else "—"),
+                                    "size": "ExtraLarge",
+                                    "weight": "Bolder",
+                                    "color": "Good" if inv_changed else "Default",
+                                },
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {"type": "TextBlock", "text": "Applied", "isSubtle": True, "size": "Small"},
+                                {
+                                    "type": "TextBlock",
+                                    "text": "Yes" if result.inventory_applied else "No",
+                                    "weight": "Bolder",
+                                    "color": "Good" if result.inventory_applied else "Warning",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "type": "ColumnSet",
+            "spacing": "Medium",
+            "separator": True,
+            "columns": [
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "items": [
+                        {"type": "TextBlock", "text": "ParkWhiz Reservation", "weight": "Bolder", "size": "Medium"},
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {"title": "Facility", "value": (p.facility_name or "—")[:120]},
+                                {"title": "Confirmation", "value": p.confirmation_number or "—"},
+                                {"title": "Purchaser", "value": p.purchaser or "—"},
+                                {"title": "Gross Price", "value": p.gross_price or "—"},
+                                {"title": "Event (email)", "value": (p.event_title or "—")[:80]},
+                                {"title": "Start", "value": _fmt_dt_short(p.reservation_start)},
+                                {"title": "End", "value": _fmt_dt_short(p.reservation_end)},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "items": [
+                        {"type": "TextBlock", "text": "SpotHero Control Panel", "weight": "Bolder", "size": "Medium"},
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {"title": "Facility", "value": (fac.get("name") or "—")[:80]},
+                                {"title": "SH ID", "value": facility_id},
+                                {"title": "Event", "value": sh_event[:80]},
+                                {"title": "Event ID", "value": f"#{event_id}"},
+                                {"title": "Window", "value": f"{sh_window_start} → {sh_window_end}"[:120]},
+                                {"title": "Matched via", "value": matched_via},
+                                {"title": "Timezone", "value": tz_name},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
     ]
-    if ev:
-        facts.extend([
-            {"title": "Matched Event ID", "value": f"#{ev.get('event_id')}"},
-            {"title": "SH Reservation Window", "value": f"{ev.get('reservation_start', '—')} → {ev.get('reservation_end', '—')}"},
-        ])
-    if p.parse_notes:
-        facts.append({"title": "Parse Notes", "value": "; ".join(p.parse_notes)})
-    if result.error:
-        facts.append({"title": "Error", "value": result.error[:300]})
+
+    if result.error or p.parse_notes:
+        body.append({
+            "type": "Container",
+            "spacing": "Small",
+            "style": "warning" if not result.inventory_applied else "default",
+            "items": [
+                {"type": "TextBlock", "text": "Notes", "weight": "Bolder", "size": "Small"},
+                {"type": "TextBlock", "text": (result.error or "; ".join(p.parse_notes))[:400], "wrap": True, "isSubtle": True},
+            ],
+        })
+
+    body.append({
+        "type": "TextBlock",
+        "text": f"Processed {result.processed_at or '—'} · {result.subject[:100]}",
+        "isSubtle": True,
+        "size": "Small",
+        "wrap": True,
+    })
+
+    operator_url = "https://spothero.com/operator"
+    if facility_id.isdigit():
+        operator_url = f"https://spothero.com/operator/facilities/{facility_id}/"
 
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.5",
         "msteams": {"width": "Full"},
-        "body": [
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "bleed": True,
-                "items": [
-                    {"type": "TextBlock", "text": "ParkWhiz Reservation", "weight": "Bolder", "size": "Large", "color": accent},
-                    {"type": "TextBlock", "text": status, "spacing": "None", "isSubtle": True},
-                ],
-            },
-            {
-                "type": "Container",
-                "spacing": "Medium",
-                "items": [
-                    {"type": "TextBlock", "text": result.subject[:120] or "—", "wrap": True, "weight": "Bolder"},
-                    {"type": "FactSet", "facts": facts},
-                ],
-            },
-            {
-                "type": "Container",
-                "spacing": "Small",
-                "items": [
-                    {"type": "TextBlock", "text": "Posted by ParkWhiz bot • review before manual follow-up if needed", "isSubtle": True, "size": "Small"},
-                ],
-            },
-        ],
+        "body": body,
         "actions": [
-            {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"},
+            {"type": "Action.OpenUrl", "title": "Open Facility in SpotHero", "url": operator_url},
+            {"type": "Action.OpenUrl", "title": "SpotHero Operator", "url": "https://spothero.com/operator"},
         ],
     }
 
@@ -511,6 +668,7 @@ def process_parkwhiz_message(
     parsed = parse_parkwhiz_email(subject=subject, body=body, tz_name=tz_name)
 
     result = ProcessResult(message_id=message_id, subject=subject, parsed=parsed)
+    result.processed_at = dt.datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d %H:%M %Z")
 
     if not parsed.facility_name:
         result.inventory_skipped_reason = "facility_not_found_in_email"
@@ -547,6 +705,8 @@ def process_parkwhiz_message(
             dry_run=dry_run,
             debug=debug,
         )
+        result.inventory_before = inv.get("before")
+        result.inventory_after = inv.get("after")
         result.inventory_applied = bool(inv.get("applied")) or (dry_run and inv.get("reason") not in {"inventory_already_zero"})
         if not result.inventory_applied:
             result.inventory_skipped_reason = inv.get("reason", "inventory_not_applied")
@@ -555,6 +715,33 @@ def process_parkwhiz_message(
         result.error = str(e)[:400]
         log.exception("ParkWhiz message %s failed", message_id)
 
+    return result
+
+
+def _process_one_and_notify(
+    *,
+    gmail: GmailClient,
+    message_id: str,
+    auth_token: str,
+    facilities: List[Dict[str, Any]],
+    tz_name: str,
+    dry_run: bool,
+    debug: bool,
+) -> ProcessResult:
+    result = process_parkwhiz_message(
+        gmail=gmail,
+        message_id=message_id,
+        auth_token=auth_token,
+        facilities=facilities,
+        tz_name=tz_name,
+        dry_run=dry_run,
+        debug=debug,
+    )
+    _post_parkwhiz_teams_card(build_parkwhiz_review_card(result=result, tz_name=tz_name))
+    try:
+        gmail.mark_as_read(message_id)
+    except Exception as e:
+        log.warning("Failed to mark ParkWhiz message %s read: %s", message_id, e)
     return result
 
 
@@ -575,36 +762,59 @@ def run_parkwhiz_poll(
     results: List[ProcessResult] = []
 
     message_ids = gmail.list_message_ids(query, max_results=max_messages)
-    log.info("ParkWhiz Gmail poll: query=%r found=%d already_processed=%d tz=%s dry_run=%s",
-             query, len(message_ids), len(processed), tz_name, dry_run)
+    pending = [mid for mid in message_ids if mid not in processed]
+    log.info(
+        "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d already_processed=%d workers=%d",
+        query, len(message_ids), len(pending), len(processed), PARKWHIZ_MAX_WORKERS,
+    )
 
-    for mid in message_ids:
-        if mid in processed:
-            continue
-        result = process_parkwhiz_message(
-            gmail=gmail,
-            message_id=mid,
-            auth_token=auth_token,
-            facilities=facilities,
-            tz_name=tz_name,
-            dry_run=dry_run,
-            debug=debug,
-        )
+    if not pending:
+        return results
+
+    if len(pending) == 1:
+        pending_results = [
+            _process_one_and_notify(
+                gmail=gmail, message_id=pending[0], auth_token=auth_token,
+                facilities=facilities, tz_name=tz_name, dry_run=dry_run, debug=debug,
+            )
+        ]
+    else:
+        pending_results = []
+        with ThreadPoolExecutor(max_workers=min(PARKWHIZ_MAX_WORKERS, len(pending))) as pool:
+            futs = {
+                pool.submit(
+                    _process_one_and_notify,
+                    gmail=gmail,
+                    message_id=mid,
+                    auth_token=auth_token,
+                    facilities=facilities,
+                    tz_name=tz_name,
+                    dry_run=dry_run,
+                    debug=debug,
+                ): mid
+                for mid in pending
+            }
+            for fut in as_completed(futs):
+                try:
+                    pending_results.append(fut.result())
+                except Exception as e:
+                    mid = futs[fut]
+                    log.exception("ParkWhiz parallel process failed for %s: %s", mid, e)
+
+    for result in pending_results:
         results.append(result)
-        _post_parkwhiz_teams_card(build_parkwhiz_review_card(result=result, tz_name=tz_name))
-        try:
-            gmail.mark_as_read(mid)
-        except Exception as e:
-            log.warning("Failed to mark ParkWhiz message %s read (need gmail.modify scope?): %s", mid, e)
-        processed.add(mid)
-        state["processed_ids"] = list(processed)
-        _save_state(state_file, state)
+        processed.add(result.message_id)
         log.info(
-            "ParkWhiz processed msg=%s facility=%s applied=%s reason=%s",
-            mid,
+            "ParkWhiz processed msg=%s facility=%s inv=%s→%s applied=%s reason=%s",
+            result.message_id,
             result.parsed.facility_name,
+            result.inventory_before,
+            result.inventory_after,
             result.inventory_applied,
             result.inventory_skipped_reason or "ok",
         )
+
+    state["processed_ids"] = list(processed)
+    _save_state(state_file, state)
 
     return results

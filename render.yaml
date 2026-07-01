@@ -56,7 +56,7 @@ services:
       - key: PARKWHIZ_ENABLED
         value: "true"
       - key: PARKWHIZ_POLL_INTERVAL_SECONDS
-        value: "30"
+        value: "10"
       - key: PARKWHIZ_DRY_RUN
         value: "false"
       - key: GMAIL_AUTH_MODE
@@ -73,5 +73,7 @@ services:
         value: "me"
       - key: GMAIL_SCOPES
         value: "readonly"
+      - key: PARKWHIZ_MAX_WORKERS
+        value: "3"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL
         sync: false

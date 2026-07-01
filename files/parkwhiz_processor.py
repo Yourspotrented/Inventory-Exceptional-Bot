@@ -420,7 +420,13 @@ def reduce_event_inventory_by_one(
     target_qty = max(0, current_total - 1)
 
     if current_total <= 0:
-        return {"applied": False, "reason": "inventory_already_zero", "before": current_total, "after": current_total}
+        # SpotHero already at 0 — likely reduced on a prior poll/deploy. Show intended -1 change.
+        return {
+            "applied": False,
+            "reason": "inventory_already_zero",
+            "before": current_total + 1,
+            "after": current_total,
+        }
 
     current_tier_number = None
     try:
@@ -613,6 +619,10 @@ def build_parkwhiz_review_card(
         headline = "Inventory Updated"
         sub = f"SpotHero inventory {result.inventory_before} → {result.inventory_after}"
         color = "Good"
+    elif result.inventory_skipped_reason == "inventory_already_zero":
+        headline = "Already Reduced"
+        sub = f"SpotHero inventory already at {result.inventory_after} (expected {result.inventory_before} → {result.inventory_after})"
+        color = "Good"
     else:
         headline = "Review Required"
         sub = result.error or result.inventory_skipped_reason or "Could not auto-apply"
@@ -661,6 +671,11 @@ _PERMANENT_SKIP_REASONS = frozenset({
     "time_parse_failed",
 })
 
+# Inventory already at target — no further action needed
+_DONE_SKIP_REASONS = frozenset({
+    "inventory_already_zero",
+})
+
 
 def _skip_message_reason(state: Dict[str, Any], message_id: str) -> Optional[str]:
     """Return why a message is skipped, or None if it should be processed."""
@@ -671,6 +686,8 @@ def _skip_message_reason(state: Dict[str, Any], message_id: str) -> Optional[str
         return "inventory_already_applied"
     reason = str(rec.get("reason") or "")
     if reason in _PERMANENT_SKIP_REASONS:
+        return reason
+    if reason in _DONE_SKIP_REASONS:
         return reason
     return None
 
@@ -704,7 +721,7 @@ def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams
     }
     done_ids = [
         mid for mid, r in by_id.items()
-        if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS
+        if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS or r.get("reason") in _DONE_SKIP_REASONS
     ]
     state["processed_ids"] = done_ids[-500:]
 
@@ -794,6 +811,13 @@ def process_parkwhiz_message(
         result.inventory_applied = bool(inv.get("applied"))
         if not result.inventory_applied and not dry_run:
             result.inventory_skipped_reason = inv.get("reason", "inventory_not_applied")
+        # Prefer stored values from a prior successful apply (e.g. after redeploy)
+        if result.inventory_skipped_reason == "inventory_already_zero":
+            prev = (_load_state(PARKWHIZ_STATE_FILE).get("by_id") or {}).get(str(message_id)) or {}
+            prev_before, prev_after = prev.get("inv_before"), prev.get("inv_after")
+            if prev_before is not None and prev_after is not None and prev_before > prev_after:
+                result.inventory_before = prev_before
+                result.inventory_after = prev_after
         log.info(
             "[PARKWHIZ] result msg=%s facility=%s event=%s inv=%s→%s applied=%s reason=%s",
             message_id,

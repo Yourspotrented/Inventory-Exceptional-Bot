@@ -367,7 +367,12 @@ def reduce_event_inventory_by_one(
         chk = client.get_event_on_day(facility_id, ev_day, ev.event_id, debug=debug)
         if chk:
             verify_after = _tiers_pairs(chk.tiers)
-            applied = verify_after == desired_pairs
+            verify_total = sum(inv for _, _, inv in verify_after)
+            applied = (verify_after == desired_pairs) or (verify_total == target_qty)
+        else:
+            # POST accepted but same-day refetch missed pagination — trust POST if no exception
+            applied = True
+            log.warning("[PARKWHIZ] verify refetch missed event_id=%s; treating POST as applied", ev.event_id)
 
     return {
         "applied": applied if not dry_run else False,
@@ -382,29 +387,52 @@ def reduce_event_inventory_by_one(
 
 
 # ---------- Teams cards (separate webhook) ----------
-def _post_parkwhiz_teams_card(card: Dict[str, Any]) -> None:
+def _post_parkwhiz_teams_card(card: Dict[str, Any], *, text_summary: str = "") -> None:
     if not PARKWHIZ_TEAMS_WEBHOOK_URL:
         return
     try:
-        payload = {
+        # Plain text ensures something visible in Teams Workflows even if Adaptive Card fails to render
+        payload: Dict[str, Any] = {
             "type": "message",
+            "text": text_summary or "ParkWhiz reservation processed.",
             "attachments": [{
                 "contentType": "application/vnd.microsoft.card.adaptive",
-                "contentUrl": None,
                 "content": card,
             }],
         }
-        requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=10)
+        r = requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=15)
+        if r.status_code >= 400:
+            log.warning("ParkWhiz Teams post HTTP %s: %s", r.status_code, (r.text or "")[:300])
     except Exception as e:
         log.warning("ParkWhiz Teams post failed: %s", e)
 
 
+def _teams_text_summary(result: ProcessResult, tz_name: str) -> str:
+    p = result.parsed
+    fac = result.facility_match or {}
+    ev = result.event_match or {}
+    status = "UPDATED" if result.inventory_applied else "REVIEW"
+    lines = [
+        f"ParkWhiz → SpotHero [{status}]",
+        f"Facility: {p.facility_name or '-'}",
+        f"SpotHero: {fac.get('name') or '-'} (ID {fac.get('id') or '-'})",
+        f"Event: {p.event_title or _sh_event_title(ev.get('raw') or {})}",
+        f"Event ID: #{ev.get('event_id') or '-'}",
+        f"Inventory: {result.inventory_before} → {result.inventory_after} (applied={result.inventory_applied})",
+        f"Confirmation: {p.confirmation_number or '-'} | Purchaser: {p.purchaser or '-'} | Price: {p.gross_price or '-'}",
+        f"Window: {_fmt_dt_short(p.reservation_start)} → {_fmt_dt_short(p.reservation_end)} ({tz_name})",
+    ]
+    if result.error:
+        lines.append(f"Note: {result.error[:200]}")
+    return "\n".join(lines)
+
+
 def _fmt_dt(ts: Optional[dt.datetime]) -> str:
-    return ts.strftime("%a, %b %d %Y %I:%M %p %Z") if ts else "—"
+    return ts.strftime("%a, %b %d %Y %I:%M %p %Z") if ts else "-"
 
 
 def _fmt_dt_short(ts: Optional[dt.datetime]) -> str:
-    return ts.strftime("%b %d · %I:%M %p") if ts else "—"
+    return ts.strftime("%b %d at %I:%M %p") if ts else "-"
 
 
 def _sh_event_title(ev_raw: Optional[Dict[str, Any]], fallback: str = "") -> str:
@@ -425,12 +453,12 @@ def _sh_event_title(ev_raw: Optional[Dict[str, Any]], fallback: str = "") -> str
 
 def _status_meta(result: ProcessResult) -> Dict[str, str]:
     if result.inventory_applied:
-        return {"label": "Inventory Updated", "color": "Good", "icon": "✓"}
+        return {"label": "Inventory Updated", "color": "Good", "icon": "[OK]"}
     if result.inventory_skipped_reason == "time_parse_failed":
-        return {"label": "Review — Time Not Parsed", "color": "Warning", "icon": "!"}
+        return {"label": "Review - Time Not Parsed", "color": "Warning", "icon": "[!]"}
     if result.inventory_skipped_reason in {"facility_not_matched", "no_matching_event_in_tolerance"}:
-        return {"label": "Review — No SpotHero Match", "color": "Warning", "icon": "?"}
-    return {"label": "Review Required", "color": "Attention", "icon": "!"}
+        return {"label": "Review - No SpotHero Match", "color": "Warning", "icon": "[?]"}
+    return {"label": "Review Required", "color": "Attention", "icon": "[!]"}
 
 
 def build_parkwhiz_review_card(
@@ -597,7 +625,7 @@ def build_parkwhiz_review_card(
         body.append({
             "type": "Container",
             "spacing": "Small",
-            "style": "warning" if not result.inventory_applied else "default",
+            "style": "attention" if not result.inventory_applied else "default",
             "items": [
                 {"type": "TextBlock", "text": "Notes", "weight": "Bolder", "size": "Small"},
                 {"type": "TextBlock", "text": (result.error or "; ".join(p.parse_notes))[:400], "wrap": True, "isSubtle": True},
@@ -619,7 +647,7 @@ def build_parkwhiz_review_card(
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
-        "version": "1.5",
+        "version": "1.4",
         "msteams": {"width": "Full"},
         "body": body,
         "actions": [
@@ -629,18 +657,52 @@ def build_parkwhiz_review_card(
     }
 
 
-# ---------- State & orchestration ----------
+# Reasons that should not be retried automatically
+_PERMANENT_SKIP_REASONS = frozenset({
+    "facility_not_found_in_email",
+    "time_parse_failed",
+})
+
+
+def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
+    """Skip only when inventory was applied or failure is permanent."""
+    rec = (state.get("by_id") or {}).get(str(message_id))
+    if not rec:
+        return False
+    if rec.get("applied"):
+        return True
+    return str(rec.get("reason") or "") in _PERMANENT_SKIP_REASONS
+
+
+def _record_message_state(state: Dict[str, Any], result: ProcessResult) -> None:
+    by_id = state.setdefault("by_id", {})
+    by_id[str(result.message_id)] = {
+        "applied": bool(result.inventory_applied),
+        "reason": result.inventory_skipped_reason or ("ok" if result.inventory_applied else ""),
+        "at": result.processed_at,
+        "inv_before": result.inventory_before,
+        "inv_after": result.inventory_after,
+    }
+    # legacy list for backwards compat in logs
+    done_ids = [mid for mid, r in by_id.items() if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS]
+    state["processed_ids"] = done_ids[-500:]
+
+
 def _load_state(path: str) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
-        return {"processed_ids": []}
+        return {"processed_ids": [], "by_id": {}}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("processed_ids"), list):
+        if isinstance(data, dict):
+            if not isinstance(data.get("by_id"), dict):
+                data["by_id"] = {}
+            if not isinstance(data.get("processed_ids"), list):
+                data["processed_ids"] = []
             return data
     except Exception:
         pass
-    return {"processed_ids": []}
+    return {"processed_ids": [], "by_id": {}}
 
 
 def _save_state(path: str, state: Dict[str, Any]) -> None:
@@ -737,7 +799,11 @@ def _process_one_and_notify(
         dry_run=dry_run,
         debug=debug,
     )
-    _post_parkwhiz_teams_card(build_parkwhiz_review_card(result=result, tz_name=tz_name))
+    summary = _teams_text_summary(result, tz_name)
+    _post_parkwhiz_teams_card(
+        build_parkwhiz_review_card(result=result, tz_name=tz_name),
+        text_summary=summary,
+    )
     try:
         gmail.mark_as_read(message_id)
     except Exception as e:
@@ -758,14 +824,14 @@ def run_parkwhiz_poll(
     max_messages: int = 10,
 ) -> List[ProcessResult]:
     state = _load_state(state_file)
-    processed = set(str(x) for x in (state.get("processed_ids") or []))
+    processed_done = set(str(x) for x in (state.get("processed_ids") or []))
     results: List[ProcessResult] = []
 
     message_ids = gmail.list_message_ids(query, max_results=max_messages)
-    pending = [mid for mid in message_ids if mid not in processed]
+    pending = [mid for mid in message_ids if not _should_skip_message(state, mid)]
     log.info(
-        "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d already_processed=%d workers=%d",
-        query, len(message_ids), len(pending), len(processed), PARKWHIZ_MAX_WORKERS,
+        "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d done=%d workers=%d",
+        query, len(message_ids), len(pending), len(processed_done), PARKWHIZ_MAX_WORKERS,
     )
 
     if not pending:
@@ -803,7 +869,7 @@ def run_parkwhiz_poll(
 
     for result in pending_results:
         results.append(result)
-        processed.add(result.message_id)
+        _record_message_state(state, result)
         log.info(
             "ParkWhiz processed msg=%s facility=%s inv=%s→%s applied=%s reason=%s",
             result.message_id,
@@ -814,7 +880,6 @@ def run_parkwhiz_poll(
             result.inventory_skipped_reason or "ok",
         )
 
-    state["processed_ids"] = list(processed)
     _save_state(state_file, state)
 
     return results

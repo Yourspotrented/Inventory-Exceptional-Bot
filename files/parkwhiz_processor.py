@@ -94,9 +94,9 @@ _TIME_SINGLE_RE = re.compile(
     re.I,
 )
 _TIME_RANGE_RE = re.compile(
-    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\w+\s+\d{1,2})\s+at\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)"
+    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\w+\s+\d{1,2}(?:,?\s+\d{4})?)\s+at\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)"
     r"\s+to\s+"
-    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\w+\s+\d{1,2})\s+at\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)",
+    r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\w+\s+\d{1,2}(?:,?\s+\d{4})?)\s+at\s+(\d{1,2}:\d{2}\s*[ap]\.?m\.?)",
     re.I,
 )
 

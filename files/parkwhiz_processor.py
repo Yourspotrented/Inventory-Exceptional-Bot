@@ -484,6 +484,18 @@ def reduce_event_inventory_by_one(
 
 
 # ---------- Teams cards (separate webhook) ----------
+def _teams_attachment_payload(card: Dict[str, Any]) -> Dict[str, Any]:
+    """Standard Teams incoming-webhook envelope (same as SH updater)."""
+    return {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": card,
+        }],
+    }
+
+
 def _post_parkwhiz_teams_card(
     card: Dict[str, Any],
     *,
@@ -495,22 +507,29 @@ def _post_parkwhiz_teams_card(
         return False
     try:
         mode = PARKWHIZ_TEAMS_WEBHOOK_MODE
-        card_payload: Any = json.dumps(card) if PARKWHIZ_TEAMS_CARD_AS_STRING else card
+        # Power Automate Adaptive Card field needs a JSON object — never a stringified blob.
+        if mode == "powerautomate" and PARKWHIZ_TEAMS_CARD_AS_STRING:
+            log.warning(
+                "ParkWhiz Teams: PARKWHIZ_TEAMS_CARD_AS_STRING=true breaks Power Automate rendering; sending object instead"
+            )
 
         if mode == "powerautomate":
-            # Power Automate: Adaptive Card field = triggerBody()?['card']  — send ONLY card object
-            payload = {"card": card_payload}
+            # PA "Post adaptive card" → Expression: triggerBody()?['card']
+            # Alternate: triggerBody()?['attachments'][0]['content']
+            payload = {
+                "card": card,
+                "adaptiveCard": card,
+                "attachments": _teams_attachment_payload(card)["attachments"],
+            }
+        elif mode in {"incoming", "teams"}:
+            payload = _teams_attachment_payload(card)
+        elif mode == "powerautomate_root":
+            # PA flow reads adaptive card from HTTP body root (no wrapper key)
+            payload = card
         elif mode == "text":
             payload = {"type": "message", "text": text_summary or "ParkWhiz reservation processed."}
         else:
-            # Standard Teams incoming webhook
-            payload = {
-                "type": "message",
-                "attachments": [{
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": card,
-                }],
-            }
+            payload = _teams_attachment_payload(card)
 
         r = requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=15)
         if r.status_code >= 400:
@@ -623,6 +642,7 @@ def build_parkwhiz_review_card(
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.4",
+        "msteams": {"width": "Full"},
         "body": [
             {"type": "TextBlock", "text": "ParkWhiz → SpotHero", "weight": "Bolder", "size": "Large"},
             {"type": "TextBlock", "text": sub, "wrap": True, "color": color, "spacing": "Small"},

@@ -75,8 +75,12 @@ services:
         value: "readonly"
       - key: PARKWHIZ_TEAMS_WEBHOOK_MODE
         value: "powerautomate"
+        # powerautomate: {"card": {...}} — PA Adaptive Card field = triggerBody()?['card']
+        # incoming: Teams incoming webhook URL (renders card natively, no PA card action needed)
+        # powerautomate_root: card JSON at HTTP body root
       - key: PARKWHIZ_TEAMS_CARD_AS_STRING
         value: "false"
+        # MUST stay false for Power Automate — true shows raw JSON text in Teams
       - key: PARKWHIZ_MAX_WORKERS
         value: "3"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL

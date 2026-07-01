@@ -71,18 +71,85 @@ class GmailClient:
             raise RuntimeError(f"Gmail API {method} {path}: {r.status_code} {r.text[:400]}")
         return r.json() if r.text else {}
 
+    def list_labels(self) -> List[Dict[str, Any]]:
+        data = self._request("GET", f"{self._user_path()}/labels")
+        return list(data.get("labels") or [])
+
+    def _resolve_label_id(self, label_name: str) -> Optional[str]:
+        want = (label_name or "").strip().lstrip("#").lower()
+        if not want:
+            return None
+        for lb in self.list_labels():
+            name = str(lb.get("name") or "").strip().lstrip("#").lower()
+            if name == want:
+                return str(lb.get("id"))
+        return None
+
+    @staticmethod
+    def _parse_gmail_query(query: str) -> Dict[str, Any]:
+        """Parse simple queries like 'label:#parkwhiz-reservation is:unread'."""
+        q = (query or "").strip()
+        label_name: Optional[str] = None
+        unread_only = False
+        m = re.search(r"label:([^\s]+)", q, flags=re.I)
+        if m:
+            label_name = m.group(1).strip().strip("'\"")
+        if re.search(r"\bis:unread\b", q, flags=re.I):
+            unread_only = True
+        return {"label_name": label_name, "unread_only": unread_only, "raw": q}
+
     def list_message_ids(self, query: str, *, max_results: int = 20) -> List[str]:
-        params: Dict[str, Any] = {"q": query, "maxResults": max(1, min(max_results, 50))}
+        """
+        List message IDs for a Gmail search query.
+
+        Prefer labelIds (works with gmail.metadata scope, same as many other bots).
+        Fall back to 'q' only when label-based listing is not possible.
+        """
+        parsed = self._parse_gmail_query(query)
+        max_results = max(1, min(max_results, 50))
+
+        if parsed.get("label_name"):
+            label_id = self._resolve_label_id(str(parsed["label_name"]))
+            if label_id:
+                label_ids = [label_id]
+                if parsed.get("unread_only"):
+                    label_ids.append("UNREAD")
+                params: Dict[str, Any] = {
+                    "labelIds": label_ids,
+                    "maxResults": max_results,
+                }
+                log.info(
+                    "Gmail list via labelIds label=%s unread_only=%s",
+                    parsed["label_name"], parsed.get("unread_only"),
+                )
+                data = self._request("GET", f"{self._user_path()}/messages", params=params)
+                msgs = data.get("messages") or []
+                return [str(m["id"]) for m in msgs if m.get("id")]
+            log.warning("Gmail label not found: %s; falling back to q search", parsed["label_name"])
+
+        params = {"q": query, "maxResults": max_results}
+        log.info("Gmail list via q=%r", query)
         data = self._request("GET", f"{self._user_path()}/messages", params=params)
         msgs = data.get("messages") or []
         return [str(m["id"]) for m in msgs if m.get("id")]
 
     def get_message(self, message_id: str) -> Dict[str, Any]:
-        return self._request(
-            "GET",
-            f"{self._user_path()}/messages/{message_id}",
-            params={"format": "full"},
-        )
+        try:
+            return self._request(
+                "GET",
+                f"{self._user_path()}/messages/{message_id}",
+                params={"format": "full"},
+            )
+        except RuntimeError as e:
+            # gmail.metadata scope cannot read bodies with format=full
+            if "403" not in str(e):
+                raise
+            log.warning("Gmail format=full denied; falling back to metadata+snippet for %s", message_id)
+            return self._request(
+                "GET",
+                f"{self._user_path()}/messages/{message_id}",
+                params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
+            )
 
     def mark_as_read(self, message_id: str) -> None:
         self._request(
@@ -112,6 +179,7 @@ def _strip_html(html: str) -> str:
 
 def extract_message_text(msg: Dict[str, Any]) -> str:
     """Return best-effort plain text from a Gmail message payload."""
+    snippet = str(msg.get("snippet") or "").strip()
     payload = msg.get("payload") or {}
     parts: List[str] = []
 
@@ -130,10 +198,13 @@ def extract_message_text(msg: Dict[str, Any]) -> str:
 
     walk(payload)
     if parts:
-        return "\n".join(p for p in parts if p.strip())
+        text = "\n".join(p for p in parts if p.strip())
+        if snippet and snippet not in text:
+            return f"{text}\n{snippet}"
+        return text
     if payload.get("body", {}).get("data"):
         return _decode_part_data(payload["body"]["data"])
-    return ""
+    return snippet
 
 
 def extract_headers(msg: Dict[str, Any]) -> Dict[str, str]:

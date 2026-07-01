@@ -595,7 +595,7 @@ def run_parkwhiz_poll(
         try:
             gmail.mark_as_read(mid)
         except Exception as e:
-            log.warning("Failed to mark ParkWhiz message %s read: %s", mid, e)
+            log.warning("Failed to mark ParkWhiz message %s read (need gmail.modify scope?): %s", mid, e)
         processed.add(mid)
         state["processed_ids"] = list(processed)
         _save_state(state_file, state)

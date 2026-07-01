@@ -76,7 +76,7 @@ services:
       - key: PARKWHIZ_TEAMS_WEBHOOK_MODE
         value: "powerautomate"
       - key: PARKWHIZ_TEAMS_CARD_AS_STRING
-        value: "true"
+        value: "false"
       - key: PARKWHIZ_MAX_WORKERS
         value: "3"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL

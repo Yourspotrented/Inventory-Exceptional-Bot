@@ -34,14 +34,15 @@ log = logging.getLogger("app.parkwhiz")
 
 DEFAULT_TZ = os.getenv("SH_UPDATE_TZ", "America/Chicago")
 PARKWHIZ_TEAMS_WEBHOOK_URL = os.getenv("PARKWHIZ_TEAMS_WEBHOOK_URL", "").strip()
-PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUTES", "20"))
+PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUTES", "30"))
+PARKWHIZ_MATCH_SAME_DAY_MINUTES = int(os.getenv("PARKWHIZ_MATCH_SAME_DAY_MINUTES", "180"))
 PARKWHIZ_STATE_FILE = os.getenv("PARKWHIZ_STATE_FILE", os.path.join("files", "parkwhiz_processed.json"))
 PARKWHIZ_DRY_RUN = os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"}
 PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "3")))
 # powerautomate = {"card": ...} for triggerBody()?['card'] in Power Automate / Workflows
 # incoming = standard Teams incoming webhook attachments format
 PARKWHIZ_TEAMS_WEBHOOK_MODE = (os.getenv("PARKWHIZ_TEAMS_WEBHOOK_MODE") or "powerautomate").strip().lower()
-PARKWHIZ_TEAMS_CARD_AS_STRING = os.getenv("PARKWHIZ_TEAMS_CARD_AS_STRING", "true").lower() in {"1", "true", "yes"}
+PARKWHIZ_TEAMS_CARD_AS_STRING = os.getenv("PARKWHIZ_TEAMS_CARD_AS_STRING", "false").lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -219,17 +220,55 @@ def _minutes_apart(a: dt.datetime, b: dt.datetime) -> int:
 
 
 def _candidate_start_times(parsed: ParsedReservation) -> List[dt.datetime]:
-    """Build candidate reservation start times for matching (raw + offset variants)."""
+    """Build candidate start times — includes +1/+2/+3hr for '+Nhr after event' emails."""
     if not parsed.reservation_start:
         return []
-    starts = [parsed.reservation_start]
+    base = parsed.reservation_start
+    starts: List[dt.datetime] = [base]
     m = _TIME_SINGLE_RE.search(parsed.raw_time_text or "")
+    max_hours = 4
     if m and m.group(3):
-        offset_hrs = int(m.group(3))
-        shifted = parsed.reservation_start + dt.timedelta(hours=offset_hrs)
-        if shifted not in starts:
-            starts.append(shifted)
+        max_hours = max(4, int(m.group(3)) + 2)
+    for h in range(1, max_hours + 1):
+        t = base + dt.timedelta(hours=h)
+        if t not in starts:
+            starts.append(t)
     return starts
+
+
+def _parkwhiz_window(parsed: ParsedReservation) -> Tuple[Optional[dt.datetime], Optional[dt.datetime]]:
+    """ParkWhiz reservation window for overlap checks."""
+    cands = _candidate_start_times(parsed)
+    if not cands:
+        return None, None
+    start = min(cands)
+    if parsed.reservation_end:
+        end = parsed.reservation_end
+    else:
+        end = max(cands) + dt.timedelta(hours=5)
+    return start, end
+
+
+def _overlap_minutes(a0: dt.datetime, a1: dt.datetime, b0: dt.datetime, b1: dt.datetime) -> int:
+    s = max(a0, b0)
+    e = min(a1, b1)
+    if e > s:
+        return int((e - s).total_seconds() // 60)
+    return 0
+
+
+def _event_match_payload(ev_raw: Dict[str, Any], win_start: dt.datetime, win_end: dt.datetime, win_label: str, score: int) -> Dict[str, Any]:
+    return {
+        "event_id": int(ev_raw["event_id"]),
+        "rule_id": ev_raw.get("rule_id"),
+        "matched_window": win_label,
+        "reservation_start": win_start.isoformat(),
+        "reservation_end": win_end.isoformat(),
+        "event_starts_offset": ev_raw.get("event_starts_offset_display") or ev_raw.get("event_starts_offset") or "00:00",
+        "event_ends_offset": ev_raw.get("event_ends_offset_display") or ev_raw.get("event_ends_offset") or "00:00",
+        "raw": ev_raw,
+        "match_score_minutes": score,
+    }
 
 
 def _find_matching_event(
@@ -267,7 +306,61 @@ def _find_matching_event(
 
     if best_match:
         return best_match, best_why
+
+    # Fallback: same-day time overlap (ParkWhiz 11:35 +offset vs SH event 1:35 PM)
+    overlap_match, overlap_why = _find_matching_event_by_overlap(
+        client, facility_id, parsed, tz_name, debug=debug,
+    )
+    if overlap_match:
+        return overlap_match, overlap_why
     return None, best_why
+
+
+def _find_matching_event_by_overlap(
+    client: SpotHeroClient,
+    facility_id: int,
+    parsed: ParsedReservation,
+    tz_name: str,
+    *,
+    debug: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    pw_start, pw_end = _parkwhiz_window(parsed)
+    if not pw_start or not pw_end:
+        return None, "missing_reservation_window"
+
+    search_from = pw_start.date() - dt.timedelta(days=1)
+    search_to = pw_end.date() + dt.timedelta(days=1)
+    candidates: List[Tuple[int, Dict[str, Any], dt.datetime, dt.datetime, str]] = []
+
+    for ev_raw in client.iter_upcoming_events(facility_id, search_from, search_to, per_page=25, max_pages=30, debug=debug):
+        for win_label, win_start, win_end in _event_time_windows(ev_raw, tz_name):
+            # Same calendar day (allow overbooking prevention even if end times differ)
+            if pw_start.date() != win_start.date() and pw_end.date() != win_end.date():
+                continue
+            ov = _overlap_minutes(pw_start, pw_end, win_start, win_end)
+            if ov > 0:
+                candidates.append((-ov, ev_raw, win_start, win_end, win_label))
+                continue
+            # Same day, closest start within 3h
+            for cand in _candidate_start_times(parsed):
+                if cand.date() != win_start.date():
+                    continue
+                delta = _minutes_apart(cand, win_start)
+                if delta <= PARKWHIZ_MATCH_SAME_DAY_MINUTES:
+                    candidates.append((delta, ev_raw, win_start, win_end, win_label))
+
+    if not candidates:
+        return None, "no_matching_event_in_tolerance"
+
+    candidates.sort(key=lambda x: x[0])
+    best = candidates[0]
+    ev_raw = best[1]
+    log.info(
+        "[PARKWHIZ] overlap match event_id=%s window=%s score=%s pw=%s→%s",
+        ev_raw.get("event_id"), best[4], best[0],
+        pw_start.isoformat(), pw_end.isoformat(),
+    )
+    return _event_match_payload(ev_raw, best[2], best[3], best[4], abs(best[0])), "matched_overlap"
 
 
 def _find_matching_event_for_start(
@@ -309,17 +402,7 @@ def _find_matching_event_for_start(
     candidates.sort(key=lambda x: x[0])
     best = candidates[0]
     ev_raw = best[1]
-    return {
-        "event_id": int(ev_raw["event_id"]),
-        "rule_id": ev_raw.get("rule_id"),
-        "matched_window": best[4],
-        "reservation_start": best[2].isoformat(),
-        "reservation_end": best[3].isoformat(),
-        "event_starts_offset": ev_raw.get("event_starts_offset_display") or ev_raw.get("event_starts_offset") or "00:00",
-        "event_ends_offset": ev_raw.get("event_ends_offset_display") or ev_raw.get("event_ends_offset") or "00:00",
-        "raw": ev_raw,
-        "match_score_minutes": best[0],
-    }, "matched"
+    return _event_match_payload(ev_raw, best[2], best[3], best[4], best[0]), "matched"
 
 
 def reduce_event_inventory_by_one(
@@ -414,18 +497,8 @@ def _post_parkwhiz_teams_card(
         card_payload: Any = json.dumps(card) if PARKWHIZ_TEAMS_CARD_AS_STRING else card
 
         if mode == "powerautomate":
-            # Power Automate: Adaptive Card field uses triggerBody()?['card']
-            payload: Dict[str, Any] = {
-                "card": card_payload,
-                "summary": text_summary or "ParkWhiz reservation",
-            }
-            if result is not None:
-                payload["inventory_applied"] = bool(result.inventory_applied)
-                payload["inventory_before"] = result.inventory_before
-                payload["inventory_after"] = result.inventory_after
-                payload["confirmation"] = result.parsed.confirmation_number
-                payload["facility_id"] = (result.facility_match or {}).get("id")
-                payload["event_id"] = (result.event_match or {}).get("event_id")
+            # Power Automate: Adaptive Card field = triggerBody()?['card']  — send ONLY card object
+            payload = {"card": card_payload}
         elif mode == "text":
             payload = {"type": "message", "text": text_summary or "ParkWhiz reservation processed."}
         else:
@@ -510,175 +583,34 @@ def build_parkwhiz_review_card(
     fac = result.facility_match or {}
     ev = result.event_match or {}
     ev_raw = ev.get("raw") or {}
-    status = _status_meta(result)
     sh_event = _sh_event_title(ev_raw, p.event_title)
-    facility_id = str(fac.get("id") or "—")
-    event_id = str(ev.get("event_id") or "—")
+    facility_id = str(fac.get("id") or "-")
+    event_id = str(ev.get("event_id") or "-")
 
-    inv_before = result.inventory_before
-    inv_after = result.inventory_after
-    inv_changed = (
-        inv_before is not None
-        and inv_after is not None
-        and inv_before != inv_after
-    )
+    if result.inventory_applied:
+        headline = "Inventory Updated"
+        sub = f"SpotHero inventory {result.inventory_before} → {result.inventory_after}"
+        color = "Good"
+    else:
+        headline = "Review Required"
+        sub = result.error or result.inventory_skipped_reason or "Could not auto-apply"
+        color = "Warning"
 
-    sh_window_start = ev.get("reservation_start") or "—"
-    sh_window_end = ev.get("reservation_end") or "—"
-    matched_via = ev.get("matched_window") or "event"
-
-    body: List[Dict[str, Any]] = [
-        {
-            "type": "Container",
-            "style": "emphasis",
-            "bleed": True,
-            "items": [
-                {
-                    "type": "ColumnSet",
-                    "columns": [
-                        {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {"type": "TextBlock", "text": "ParkWhiz → SpotHero", "weight": "Bolder", "size": "Large"},
-                                {"type": "TextBlock", "text": "Reservation sync · 2026", "isSubtle": True, "spacing": "None", "size": "Small"},
-                            ],
-                        },
-                        {
-                            "type": "Column",
-                            "width": "auto",
-                            "items": [
-                                {
-                                    "type": "TextBlock",
-                                    "text": f"{status['icon']} {status['label']}",
-                                    "color": status["color"],
-                                    "weight": "Bolder",
-                                    "horizontalAlignment": "Right",
-                                    "wrap": True,
-                                },
-                            ],
-                        },
-                    ],
-                },
-            ],
-        },
-        {
-            "type": "Container",
-            "spacing": "Medium",
-            "items": [
-                {"type": "TextBlock", "text": "Inventory Change (Control Panel)", "weight": "Bolder", "size": "Medium"},
-                {
-                    "type": "ColumnSet",
-                    "columns": [
-                        {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {"type": "TextBlock", "text": "Before", "isSubtle": True, "size": "Small"},
-                                {"type": "TextBlock", "text": str(inv_before if inv_before is not None else "—"), "size": "ExtraLarge", "weight": "Bolder"},
-                            ],
-                        },
-                        {
-                            "type": "Column",
-                            "width": "auto",
-                            "items": [{"type": "TextBlock", "text": "→", "size": "ExtraLarge", "horizontalAlignment": "Center"}],
-                        },
-                        {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {"type": "TextBlock", "text": "After", "isSubtle": True, "size": "Small"},
-                                {
-                                    "type": "TextBlock",
-                                    "text": str(inv_after if inv_after is not None else "—"),
-                                    "size": "ExtraLarge",
-                                    "weight": "Bolder",
-                                    "color": "Good" if inv_changed else "Default",
-                                },
-                            ],
-                        },
-                        {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {"type": "TextBlock", "text": "Applied", "isSubtle": True, "size": "Small"},
-                                {
-                                    "type": "TextBlock",
-                                    "text": "Yes" if result.inventory_applied else "No",
-                                    "weight": "Bolder",
-                                    "color": "Good" if result.inventory_applied else "Warning",
-                                },
-                            ],
-                        },
-                    ],
-                },
-            ],
-        },
-        {
-            "type": "ColumnSet",
-            "spacing": "Medium",
-            "separator": True,
-            "columns": [
-                {
-                    "type": "Column",
-                    "width": "stretch",
-                    "items": [
-                        {"type": "TextBlock", "text": "ParkWhiz Reservation", "weight": "Bolder", "size": "Medium"},
-                        {
-                            "type": "FactSet",
-                            "facts": [
-                                {"title": "Facility", "value": (p.facility_name or "—")[:120]},
-                                {"title": "Confirmation", "value": p.confirmation_number or "—"},
-                                {"title": "Purchaser", "value": p.purchaser or "—"},
-                                {"title": "Gross Price", "value": p.gross_price or "—"},
-                                {"title": "Event (email)", "value": (p.event_title or "—")[:80]},
-                                {"title": "Start", "value": _fmt_dt_short(p.reservation_start)},
-                                {"title": "End", "value": _fmt_dt_short(p.reservation_end)},
-                            ],
-                        },
-                    ],
-                },
-                {
-                    "type": "Column",
-                    "width": "stretch",
-                    "items": [
-                        {"type": "TextBlock", "text": "SpotHero Control Panel", "weight": "Bolder", "size": "Medium"},
-                        {
-                            "type": "FactSet",
-                            "facts": [
-                                {"title": "Facility", "value": (fac.get("name") or "—")[:80]},
-                                {"title": "SH ID", "value": facility_id},
-                                {"title": "Event", "value": sh_event[:80]},
-                                {"title": "Event ID", "value": f"#{event_id}"},
-                                {"title": "Window", "value": f"{sh_window_start} → {sh_window_end}"[:120]},
-                                {"title": "Matched via", "value": matched_via},
-                                {"title": "Timezone", "value": tz_name},
-                            ],
-                        },
-                    ],
-                },
-            ],
-        },
+    facts = [
+        {"title": "Status", "value": headline},
+        {"title": "ParkWhiz Facility", "value": (p.facility_name or "-")[:100]},
+        {"title": "Confirmation", "value": p.confirmation_number or "-"},
+        {"title": "Purchaser", "value": p.purchaser or "-"},
+        {"title": "Price", "value": p.gross_price or "-"},
+        {"title": "Email Event", "value": (p.event_title or "-")[:80]},
+        {"title": "ParkWhiz Time", "value": p.raw_time_text or _fmt_dt_short(p.reservation_start)},
+        {"title": "SpotHero Facility", "value": (fac.get("name") or "-")[:80]},
+        {"title": "SpotHero ID", "value": facility_id},
+        {"title": "Control Panel Event", "value": sh_event[:80]},
+        {"title": "Event ID", "value": f"#{event_id}"},
+        {"title": "SH Window", "value": f"{ev.get('reservation_start', '-')} → {ev.get('reservation_end', '-')}"[:100]},
+        {"title": "Inventory", "value": f"{result.inventory_before} → {result.inventory_after}"},
     ]
-
-    if result.error or p.parse_notes:
-        body.append({
-            "type": "Container",
-            "spacing": "Small",
-            "style": "attention" if not result.inventory_applied else "default",
-            "items": [
-                {"type": "TextBlock", "text": "Notes", "weight": "Bolder", "size": "Small"},
-                {"type": "TextBlock", "text": (result.error or "; ".join(p.parse_notes))[:400], "wrap": True, "isSubtle": True},
-            ],
-        })
-
-    body.append({
-        "type": "TextBlock",
-        "text": f"Processed {result.processed_at or '—'} · {result.subject[:100]}",
-        "isSubtle": True,
-        "size": "Small",
-        "wrap": True,
-    })
 
     operator_url = "https://spothero.com/operator"
     if facility_id.isdigit():
@@ -688,11 +620,14 @@ def build_parkwhiz_review_card(
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
         "version": "1.4",
-        "msteams": {"width": "Full"},
-        "body": body,
+        "body": [
+            {"type": "TextBlock", "text": "ParkWhiz → SpotHero", "weight": "Bolder", "size": "Large"},
+            {"type": "TextBlock", "text": sub, "wrap": True, "color": color, "spacing": "Small"},
+            {"type": "FactSet", "facts": facts, "spacing": "Medium"},
+            {"type": "TextBlock", "text": f"{result.processed_at or ''} · {tz_name}", "isSubtle": True, "size": "Small"},
+        ],
         "actions": [
-            {"type": "Action.OpenUrl", "title": "Open Facility in SpotHero", "url": operator_url},
-            {"type": "Action.OpenUrl", "title": "SpotHero Operator", "url": "https://spothero.com/operator"},
+            {"type": "Action.OpenUrl", "title": "Open in SpotHero", "url": operator_url},
         ],
     }
 
@@ -715,14 +650,9 @@ def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
 
 
 def _should_send_teams(state: Dict[str, Any], message_id: str, result: ProcessResult) -> bool:
-    """Teams once per message, but resend if inventory just applied after a prior failed attempt."""
+    """One Teams card per Gmail message — never resend."""
     rec = (state.get("by_id") or {}).get(str(message_id)) or {}
-    if not rec.get("teams_sent"):
-        return True
-    # Resend exactly once when inventory becomes applied (user may have seen empty card before)
-    if result.inventory_applied and not rec.get("applied"):
-        return True
-    return False
+    return not rec.get("teams_sent")
 
 
 def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams_sent: bool = False) -> None:

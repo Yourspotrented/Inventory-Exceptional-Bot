@@ -73,6 +73,10 @@ services:
         value: "me"
       - key: GMAIL_SCOPES
         value: "readonly"
+      - key: PARKWHIZ_TEAMS_WEBHOOK_MODE
+        value: "powerautomate"
+      - key: PARKWHIZ_TEAMS_CARD_AS_STRING
+        value: "true"
       - key: PARKWHIZ_MAX_WORKERS
         value: "3"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL

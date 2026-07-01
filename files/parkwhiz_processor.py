@@ -38,8 +38,10 @@ PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUT
 PARKWHIZ_STATE_FILE = os.getenv("PARKWHIZ_STATE_FILE", os.path.join("files", "parkwhiz_processed.json"))
 PARKWHIZ_DRY_RUN = os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"}
 PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "3")))
-PARKWHIZ_MAX_INVENTORY_RETRIES = max(1, int(os.getenv("PARKWHIZ_MAX_INVENTORY_RETRIES", "5")))
-PARKWHIZ_TEAMS_CARD_MODE = (os.getenv("PARKWHIZ_TEAMS_CARD_MODE") or "card").strip().lower()
+# powerautomate = {"card": ...} for triggerBody()?['card'] in Power Automate / Workflows
+# incoming = standard Teams incoming webhook attachments format
+PARKWHIZ_TEAMS_WEBHOOK_MODE = (os.getenv("PARKWHIZ_TEAMS_WEBHOOK_MODE") or "powerautomate").strip().lower()
+PARKWHIZ_TEAMS_CARD_AS_STRING = os.getenv("PARKWHIZ_TEAMS_CARD_AS_STRING", "true").lower() in {"1", "true", "yes"}
 
 
 @dataclass
@@ -361,20 +363,30 @@ def reduce_event_inventory_by_one(
         stop_selling_before_duration=None,
         dry_run=dry_run,
     )
+    log.info(
+        "[PARKWHIZ] POST event_id=%s facility=%s inventory %s→%s dry_run=%s",
+        ev.event_id, facility_id, current_total, target_qty, dry_run,
+    )
 
     applied = False
     verify_after = None
-    if not dry_run:
+    if dry_run:
+        applied = False
+    else:
+        # POST succeeded without exception — treat as applied (ParkWhiz must act fast)
+        applied = True
         ev_day = ev.event_starts_local.date() if ev.event_starts_local else dt.date.today()
         chk = client.get_event_on_day(facility_id, ev_day, ev.event_id, debug=debug)
         if chk:
             verify_after = _tiers_pairs(chk.tiers)
             verify_total = sum(inv for _, _, inv in verify_after)
-            applied = (verify_after == desired_pairs) or (verify_total == target_qty)
+            if verify_total != target_qty:
+                log.warning(
+                    "[PARKWHIZ] verify mismatch event_id=%s expected=%s got=%s (POST was sent)",
+                    ev.event_id, target_qty, verify_total,
+                )
         else:
-            # POST accepted but same-day refetch missed pagination — trust POST if no exception
-            applied = True
-            log.warning("[PARKWHIZ] verify refetch missed event_id=%s; treating POST as applied", ev.event_id)
+            log.warning("[PARKWHIZ] verify refetch missed event_id=%s (POST was sent)", ev.event_id)
 
     return {
         "applied": applied if not dry_run else False,
@@ -389,15 +401,35 @@ def reduce_event_inventory_by_one(
 
 
 # ---------- Teams cards (separate webhook) ----------
-def _post_parkwhiz_teams_card(card: Dict[str, Any], *, text_summary: str = "") -> None:
+def _post_parkwhiz_teams_card(
+    card: Dict[str, Any],
+    *,
+    text_summary: str = "",
+    result: Optional[ProcessResult] = None,
+) -> None:
     if not PARKWHIZ_TEAMS_WEBHOOK_URL:
         return
     try:
-        # Power Automate Workflows renders text + attachment as separate blocks — send ONE format only
-        mode = PARKWHIZ_TEAMS_CARD_MODE
-        if mode == "text":
-            payload: Dict[str, Any] = {"type": "message", "text": text_summary or "ParkWhiz reservation processed."}
+        mode = PARKWHIZ_TEAMS_WEBHOOK_MODE
+        card_payload: Any = json.dumps(card) if PARKWHIZ_TEAMS_CARD_AS_STRING else card
+
+        if mode == "powerautomate":
+            # Power Automate: Adaptive Card field uses triggerBody()?['card']
+            payload: Dict[str, Any] = {
+                "card": card_payload,
+                "summary": text_summary or "ParkWhiz reservation",
+            }
+            if result is not None:
+                payload["inventory_applied"] = bool(result.inventory_applied)
+                payload["inventory_before"] = result.inventory_before
+                payload["inventory_after"] = result.inventory_after
+                payload["confirmation"] = result.parsed.confirmation_number
+                payload["facility_id"] = (result.facility_match or {}).get("id")
+                payload["event_id"] = (result.event_match or {}).get("event_id")
+        elif mode == "text":
+            payload = {"type": "message", "text": text_summary or "ParkWhiz reservation processed."}
         else:
+            # Standard Teams incoming webhook
             payload = {
                 "type": "message",
                 "attachments": [{
@@ -405,11 +437,12 @@ def _post_parkwhiz_teams_card(card: Dict[str, Any], *, text_summary: str = "") -
                     "content": card,
                 }],
             }
+
         r = requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=15)
         if r.status_code >= 400:
             log.warning("ParkWhiz Teams post HTTP %s: %s", r.status_code, (r.text or "")[:300])
         else:
-            log.info("ParkWhiz Teams card posted (mode=%s)", mode)
+            log.info("ParkWhiz Teams posted mode=%s card_as_string=%s", mode, PARKWHIZ_TEAMS_CARD_AS_STRING)
     except Exception as e:
         log.warning("ParkWhiz Teams post failed: %s", e)
 
@@ -672,24 +705,24 @@ _PERMANENT_SKIP_REASONS = frozenset({
 
 
 def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
-    """Skip when done, permanently failed, or inventory retries exhausted."""
+    """Skip only when inventory was applied or failure is permanent."""
     rec = (state.get("by_id") or {}).get(str(message_id))
     if not rec:
         return False
     if rec.get("applied"):
         return True
-    reason = str(rec.get("reason") or "")
-    if reason in _PERMANENT_SKIP_REASONS:
+    return str(rec.get("reason") or "") in _PERMANENT_SKIP_REASONS
+
+
+def _should_send_teams(state: Dict[str, Any], message_id: str, result: ProcessResult) -> bool:
+    """Teams once per message, but resend if inventory just applied after a prior failed attempt."""
+    rec = (state.get("by_id") or {}).get(str(message_id)) or {}
+    if not rec.get("teams_sent"):
         return True
-    if int(rec.get("attempts") or 0) >= PARKWHIZ_MAX_INVENTORY_RETRIES:
+    # Resend exactly once when inventory becomes applied (user may have seen empty card before)
+    if result.inventory_applied and not rec.get("applied"):
         return True
     return False
-
-
-def _should_send_teams(state: Dict[str, Any], message_id: str) -> bool:
-    """Teams notification is sent at most once per Gmail message."""
-    rec = (state.get("by_id") or {}).get(str(message_id))
-    return not (rec and rec.get("teams_sent"))
 
 
 def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams_sent: bool = False) -> None:
@@ -711,7 +744,6 @@ def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams
     done_ids = [
         mid for mid, r in by_id.items()
         if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS
-        or int(r.get("attempts") or 0) >= PARKWHIZ_MAX_INVENTORY_RETRIES
     ]
     state["processed_ids"] = done_ids[-500:]
 
@@ -784,6 +816,7 @@ def process_parkwhiz_message(
         if not ev_match:
             result.inventory_skipped_reason = why
             result.error = f"No SpotHero event matched for time window ({why})"
+            log.warning("[PARKWHIZ] no event match facility=%s time=%s reason=%s", facility_id, parsed.raw_time_text, why)
             return result
         result.event_match = ev_match
 
@@ -797,9 +830,19 @@ def process_parkwhiz_message(
         )
         result.inventory_before = inv.get("before")
         result.inventory_after = inv.get("after")
-        result.inventory_applied = bool(inv.get("applied")) or (dry_run and inv.get("reason") not in {"inventory_already_zero"})
-        if not result.inventory_applied:
+        result.inventory_applied = bool(inv.get("applied"))
+        if not result.inventory_applied and not dry_run:
             result.inventory_skipped_reason = inv.get("reason", "inventory_not_applied")
+        log.info(
+            "[PARKWHIZ] result msg=%s facility=%s event=%s inv=%s→%s applied=%s reason=%s",
+            message_id,
+            facility_id,
+            ev_match.get("event_id"),
+            result.inventory_before,
+            result.inventory_after,
+            result.inventory_applied,
+            result.inventory_skipped_reason or "ok",
+        )
     except Exception as e:
         result.inventory_skipped_reason = "processing_error"
         result.error = str(e)[:400]
@@ -837,11 +880,12 @@ def _finalize_result(
     state: Dict[str, Any],
 ) -> None:
     teams_sent = False
-    if _should_send_teams(state, result.message_id):
+    if _should_send_teams(state, result.message_id, result):
         summary = _teams_text_summary(result, tz_name)
         _post_parkwhiz_teams_card(
             build_parkwhiz_review_card(result=result, tz_name=tz_name),
             text_summary=summary,
+            result=result,
         )
         teams_sent = True
     else:

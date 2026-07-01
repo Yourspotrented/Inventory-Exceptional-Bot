@@ -64,7 +64,7 @@ class Settings(BaseModel):
 
     # --- ParkWhiz Gmail reservation flow (separate from SH updater) ---
     PARKWHIZ_ENABLED: bool = (os.getenv("PARKWHIZ_ENABLED", "false").lower() in {"1", "true", "yes"})
-    PARKWHIZ_POLL_INTERVAL_SECONDS: int = int(os.getenv("PARKWHIZ_POLL_INTERVAL_SECONDS", "90"))
+    PARKWHIZ_POLL_INTERVAL_SECONDS: int = int(os.getenv("PARKWHIZ_POLL_INTERVAL_SECONDS", "30"))
     PARKWHIZ_DRY_RUN: bool = (os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"})
     PARKWHIZ_DEBUG: bool = (os.getenv("PARKWHIZ_DEBUG", "false").lower() in {"1", "true", "yes"})
     GMAIL_AUTH_MODE: str = (os.getenv("GMAIL_AUTH_MODE") or "oauth").strip().lower()
@@ -399,15 +399,25 @@ async def parkwhiz_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
     """
     Poll Gmail for ParkWhiz reservation emails, reduce SpotHero inventory by 1,
     and notify a separate Teams webhook. Does not touch the SH updater flow.
+    Runs in parallel with sh_update_loop (separate asyncio task).
     """
-    if not settings.PARKWHIZ_ENABLED or run_parkwhiz_poll is None or GmailClient is None:
+    if run_parkwhiz_poll is None or GmailClient is None:
+        log.warning("ParkWhiz: modules not loaded; loop will not run.")
+        return
+    if not settings.PARKWHIZ_ENABLED:
+        log.info("ParkWhiz: disabled (set PARKWHIZ_ENABLED=true to enable).")
         return
     if not _have_gmail_envs():
-        log.warning("ParkWhiz: enabled but Gmail OAuth envs missing; loop will not run.")
+        log.warning("ParkWhiz: enabled but Gmail OAuth envs missing (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN).")
         return
 
     await app.state.token_ready.wait()
-    interval = max(30, int(settings.PARKWHIZ_POLL_INTERVAL_SECONDS))
+    interval = max(15, int(settings.PARKWHIZ_POLL_INTERVAL_SECONDS))
+
+    log.info(
+        "ParkWhiz: loop starting (parallel to SH updater) poll_every=%ss query=%r dry_run=%s tz=%s",
+        interval, settings.GMAIL_QUERY, settings.PARKWHIZ_DRY_RUN, settings.SH_UPDATE_TZ,
+    )
 
     gmail = GmailClient(
         client_id=settings.GOOGLE_CLIENT_ID,
@@ -438,8 +448,10 @@ async def parkwhiz_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
             if results:
                 applied = sum(1 for r in results if r.inventory_applied)
                 log.info("ParkWhiz poll: processed=%d inventory_applied=%d", len(results), applied)
+            else:
+                log.debug("ParkWhiz poll: no new messages")
         except Exception as e:
-            log.warning("ParkWhiz poll failed: %s", e)
+            log.warning("ParkWhiz poll failed: %s", e, exc_info=settings.PARKWHIZ_DEBUG)
 
         try:
             await asyncio.wait_for(stop_evt.wait(), timeout=interval)

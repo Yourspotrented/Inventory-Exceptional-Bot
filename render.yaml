@@ -54,9 +54,9 @@ services:
 
       # ParkWhiz reservation flow (disabled by default; enable in Render secrets)
       - key: PARKWHIZ_ENABLED
-        value: "false"
+        value: "true"
       - key: PARKWHIZ_POLL_INTERVAL_SECONDS
-        value: "90"
+        value: "30"
       - key: PARKWHIZ_DRY_RUN
         value: "false"
       - key: GMAIL_AUTH_MODE

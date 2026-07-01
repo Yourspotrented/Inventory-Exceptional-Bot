@@ -176,23 +176,33 @@ def parse_parkwhiz_email(*, subject: str, body: str, tz_name: str = DEFAULT_TZ) 
 
 
 # ---------- SpotHero matching & inventory ----------
-def _parse_reservation_local(ev_raw: Dict[str, Any], tz_name: str) -> Tuple[Optional[dt.datetime], Optional[dt.datetime]]:
+def _parse_api_dt(val: Optional[str], tz_name: str) -> Optional[dt.datetime]:
+    if not val:
+        return None
     tz = ZoneInfo(tz_name)
+    try:
+        naive = dt.datetime.strptime(val, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        naive = dt.datetime.fromisoformat(val.replace("Z", "+00:00"))
+        if naive.tzinfo is not None:
+            return naive.astimezone(tz)
+    return naive.replace(tzinfo=tz)
 
-    def _one(val: Optional[str]) -> Optional[dt.datetime]:
-        if not val:
-            return None
-        try:
-            naive = dt.datetime.strptime(val, "%Y-%m-%dT%H:%M")
-        except ValueError:
-            naive = dt.datetime.fromisoformat(val.replace("Z", "+00:00"))
-            if naive.tzinfo is not None:
-                return naive.astimezone(tz)
-        return naive.replace(tzinfo=tz)
 
-    rs = ev_raw.get("reservation_starts") or ev_raw.get("event_starts")
-    re_ = ev_raw.get("reservation_ends") or ev_raw.get("event_ends")
-    return _one(rs), _one(re_)
+def _event_time_windows(ev_raw: Dict[str, Any], tz_name: str) -> List[Tuple[str, dt.datetime, dt.datetime]]:
+    """Return (label, start, end) pairs for both event and reservation windows."""
+    windows: List[Tuple[str, dt.datetime, dt.datetime]] = []
+    for label, sk, ek in (
+        ("event", "event_starts", "event_ends"),
+        ("reservation", "reservation_starts", "reservation_ends"),
+    ):
+        start = _parse_api_dt(ev_raw.get(sk), tz_name)
+        end = _parse_api_dt(ev_raw.get(ek), tz_name)
+        if start:
+            if not end:
+                end = start + dt.timedelta(hours=4)
+            windows.append((label, start, end))
+    return windows
 
 
 def _minutes_apart(a: dt.datetime, b: dt.datetime) -> int:
@@ -272,23 +282,17 @@ def _find_matching_event_for_start(
     search_from = start_day - dt.timedelta(days=1)
     search_to = end_day + dt.timedelta(days=1)
 
-    candidates: List[Tuple[int, Dict[str, Any], dt.datetime, dt.datetime]] = []
+    candidates: List[Tuple[int, Dict[str, Any], dt.datetime, dt.datetime, str]] = []
     for ev_raw in client.iter_upcoming_events(facility_id, search_from, search_to, per_page=25, max_pages=30, debug=debug):
-        res_start, res_end = _parse_reservation_local(ev_raw, tz_name)
-        if not res_start:
-            continue
-        if not res_end:
-            res_end = res_start + dt.timedelta(hours=4)
-
-        start_delta = _minutes_apart(res_start, parsed.reservation_start)
-        if parsed.reservation_end:
-            end_delta = _minutes_apart(res_end, parsed.reservation_end)
-            score = start_delta + end_delta
-            if start_delta <= tolerance_min and end_delta <= tolerance_min:
-                candidates.append((score, ev_raw, res_start, res_end))
-        else:
-            if start_delta <= tolerance_min:
-                candidates.append((start_delta, ev_raw, res_start, res_end))
+        for win_label, win_start, win_end in _event_time_windows(ev_raw, tz_name):
+            start_delta = _minutes_apart(win_start, parsed.reservation_start)
+            if parsed.reservation_end:
+                end_delta = _minutes_apart(win_end, parsed.reservation_end)
+                score = start_delta + end_delta
+                if start_delta <= tolerance_min and end_delta <= tolerance_min:
+                    candidates.append((score, ev_raw, win_start, win_end, win_label))
+            elif start_delta <= tolerance_min:
+                candidates.append((start_delta, ev_raw, win_start, win_end, win_label))
 
     if not candidates:
         return None, "no_matching_event_in_tolerance"
@@ -299,6 +303,7 @@ def _find_matching_event_for_start(
     return {
         "event_id": int(ev_raw["event_id"]),
         "rule_id": ev_raw.get("rule_id"),
+        "matched_window": best[4],
         "reservation_start": best[2].isoformat(),
         "reservation_end": best[3].isoformat(),
         "event_starts_offset": ev_raw.get("event_starts_offset_display") or ev_raw.get("event_starts_offset") or "00:00",
@@ -569,7 +574,11 @@ def run_parkwhiz_poll(
     processed = set(str(x) for x in (state.get("processed_ids") or []))
     results: List[ProcessResult] = []
 
-    for mid in gmail.list_message_ids(query, max_results=max_messages):
+    message_ids = gmail.list_message_ids(query, max_results=max_messages)
+    log.info("ParkWhiz Gmail poll: query=%r found=%d already_processed=%d tz=%s dry_run=%s",
+             query, len(message_ids), len(processed), tz_name, dry_run)
+
+    for mid in message_ids:
         if mid in processed:
             continue
         result = process_parkwhiz_message(

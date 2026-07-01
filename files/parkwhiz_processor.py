@@ -38,6 +38,8 @@ PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUT
 PARKWHIZ_STATE_FILE = os.getenv("PARKWHIZ_STATE_FILE", os.path.join("files", "parkwhiz_processed.json"))
 PARKWHIZ_DRY_RUN = os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"}
 PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "3")))
+PARKWHIZ_MAX_INVENTORY_RETRIES = max(1, int(os.getenv("PARKWHIZ_MAX_INVENTORY_RETRIES", "5")))
+PARKWHIZ_TEAMS_CARD_MODE = (os.getenv("PARKWHIZ_TEAMS_CARD_MODE") or "card").strip().lower()
 
 
 @dataclass
@@ -391,18 +393,23 @@ def _post_parkwhiz_teams_card(card: Dict[str, Any], *, text_summary: str = "") -
     if not PARKWHIZ_TEAMS_WEBHOOK_URL:
         return
     try:
-        # Plain text ensures something visible in Teams Workflows even if Adaptive Card fails to render
-        payload: Dict[str, Any] = {
-            "type": "message",
-            "text": text_summary or "ParkWhiz reservation processed.",
-            "attachments": [{
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": card,
-            }],
-        }
+        # Power Automate Workflows renders text + attachment as separate blocks — send ONE format only
+        mode = PARKWHIZ_TEAMS_CARD_MODE
+        if mode == "text":
+            payload: Dict[str, Any] = {"type": "message", "text": text_summary or "ParkWhiz reservation processed."}
+        else:
+            payload = {
+                "type": "message",
+                "attachments": [{
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": card,
+                }],
+            }
         r = requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=15)
         if r.status_code >= 400:
             log.warning("ParkWhiz Teams post HTTP %s: %s", r.status_code, (r.text or "")[:300])
+        else:
+            log.info("ParkWhiz Teams card posted (mode=%s)", mode)
     except Exception as e:
         log.warning("ParkWhiz Teams post failed: %s", e)
 
@@ -665,26 +672,47 @@ _PERMANENT_SKIP_REASONS = frozenset({
 
 
 def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
-    """Skip only when inventory was applied or failure is permanent."""
+    """Skip when done, permanently failed, or inventory retries exhausted."""
     rec = (state.get("by_id") or {}).get(str(message_id))
     if not rec:
         return False
     if rec.get("applied"):
         return True
-    return str(rec.get("reason") or "") in _PERMANENT_SKIP_REASONS
+    reason = str(rec.get("reason") or "")
+    if reason in _PERMANENT_SKIP_REASONS:
+        return True
+    if int(rec.get("attempts") or 0) >= PARKWHIZ_MAX_INVENTORY_RETRIES:
+        return True
+    return False
 
 
-def _record_message_state(state: Dict[str, Any], result: ProcessResult) -> None:
+def _should_send_teams(state: Dict[str, Any], message_id: str) -> bool:
+    """Teams notification is sent at most once per Gmail message."""
+    rec = (state.get("by_id") or {}).get(str(message_id))
+    return not (rec and rec.get("teams_sent"))
+
+
+def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams_sent: bool = False) -> None:
     by_id = state.setdefault("by_id", {})
-    by_id[str(result.message_id)] = {
+    mid = str(result.message_id)
+    prev = by_id.get(mid) or {}
+    attempts = int(prev.get("attempts") or 0) + 1
+    by_id[mid] = {
+        **prev,
         "applied": bool(result.inventory_applied),
-        "reason": result.inventory_skipped_reason or ("ok" if result.inventory_applied else ""),
+        "reason": result.inventory_skipped_reason or ("ok" if result.inventory_applied else prev.get("reason", "")),
         "at": result.processed_at,
         "inv_before": result.inventory_before,
         "inv_after": result.inventory_after,
+        "attempts": attempts,
+        "teams_sent": bool(prev.get("teams_sent")) or bool(teams_sent),
+        "confirmation": result.parsed.confirmation_number or prev.get("confirmation"),
     }
-    # legacy list for backwards compat in logs
-    done_ids = [mid for mid, r in by_id.items() if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS]
+    done_ids = [
+        mid for mid, r in by_id.items()
+        if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS
+        or int(r.get("attempts") or 0) >= PARKWHIZ_MAX_INVENTORY_RETRIES
+    ]
     state["processed_ids"] = done_ids[-500:]
 
 
@@ -780,7 +808,7 @@ def process_parkwhiz_message(
     return result
 
 
-def _process_one_and_notify(
+def _process_one(
     *,
     gmail: GmailClient,
     message_id: str,
@@ -790,7 +818,7 @@ def _process_one_and_notify(
     dry_run: bool,
     debug: bool,
 ) -> ProcessResult:
-    result = process_parkwhiz_message(
+    return process_parkwhiz_message(
         gmail=gmail,
         message_id=message_id,
         auth_token=auth_token,
@@ -799,16 +827,33 @@ def _process_one_and_notify(
         dry_run=dry_run,
         debug=debug,
     )
-    summary = _teams_text_summary(result, tz_name)
-    _post_parkwhiz_teams_card(
-        build_parkwhiz_review_card(result=result, tz_name=tz_name),
-        text_summary=summary,
-    )
-    try:
-        gmail.mark_as_read(message_id)
-    except Exception as e:
-        log.warning("Failed to mark ParkWhiz message %s read: %s", message_id, e)
-    return result
+
+
+def _finalize_result(
+    *,
+    gmail: GmailClient,
+    result: ProcessResult,
+    tz_name: str,
+    state: Dict[str, Any],
+) -> None:
+    teams_sent = False
+    if _should_send_teams(state, result.message_id):
+        summary = _teams_text_summary(result, tz_name)
+        _post_parkwhiz_teams_card(
+            build_parkwhiz_review_card(result=result, tz_name=tz_name),
+            text_summary=summary,
+        )
+        teams_sent = True
+    else:
+        log.info("ParkWhiz Teams skipped for msg=%s (already notified)", result.message_id)
+
+    _record_message_state(state, result, teams_sent=teams_sent)
+
+    if result.inventory_applied:
+        try:
+            gmail.mark_as_read(result.message_id)
+        except Exception as e:
+            log.warning("Failed to mark ParkWhiz message %s read: %s", result.message_id, e)
 
 
 def run_parkwhiz_poll(
@@ -838,18 +883,16 @@ def run_parkwhiz_poll(
         return results
 
     if len(pending) == 1:
-        pending_results = [
-            _process_one_and_notify(
-                gmail=gmail, message_id=pending[0], auth_token=auth_token,
-                facilities=facilities, tz_name=tz_name, dry_run=dry_run, debug=debug,
-            )
-        ]
+        pending_results = [_process_one(
+            gmail=gmail, message_id=pending[0], auth_token=auth_token,
+            facilities=facilities, tz_name=tz_name, dry_run=dry_run, debug=debug,
+        )]
     else:
         pending_results = []
         with ThreadPoolExecutor(max_workers=min(PARKWHIZ_MAX_WORKERS, len(pending))) as pool:
             futs = {
                 pool.submit(
-                    _process_one_and_notify,
+                    _process_one,
                     gmail=gmail,
                     message_id=mid,
                     auth_token=auth_token,
@@ -868,8 +911,8 @@ def run_parkwhiz_poll(
                     log.exception("ParkWhiz parallel process failed for %s: %s", mid, e)
 
     for result in pending_results:
+        _finalize_result(gmail=gmail, result=result, tz_name=tz_name, state=state)
         results.append(result)
-        _record_message_state(state, result)
         log.info(
             "ParkWhiz processed msg=%s facility=%s inv=%s→%s applied=%s reason=%s",
             result.message_id,

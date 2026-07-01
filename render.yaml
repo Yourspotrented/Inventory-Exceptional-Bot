@@ -70,6 +70,8 @@ services:
       - key: GOOGLE_REFRESH_TOKEN
         sync: false
       - key: GMAIL_DELEGATE_USER
-        sync: false
+        value: "me"
+      - key: GMAIL_SCOPES
+        value: "readonly"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL
         sync: false

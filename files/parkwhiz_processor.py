@@ -489,9 +489,10 @@ def _post_parkwhiz_teams_card(
     *,
     text_summary: str = "",
     result: Optional[ProcessResult] = None,
-) -> None:
+) -> bool:
     if not PARKWHIZ_TEAMS_WEBHOOK_URL:
-        return
+        log.warning("ParkWhiz Teams not sent: PARKWHIZ_TEAMS_WEBHOOK_URL is not configured")
+        return False
     try:
         mode = PARKWHIZ_TEAMS_WEBHOOK_MODE
         card_payload: Any = json.dumps(card) if PARKWHIZ_TEAMS_CARD_AS_STRING else card
@@ -514,10 +515,12 @@ def _post_parkwhiz_teams_card(
         r = requests.post(PARKWHIZ_TEAMS_WEBHOOK_URL, json=payload, timeout=15)
         if r.status_code >= 400:
             log.warning("ParkWhiz Teams post HTTP %s: %s", r.status_code, (r.text or "")[:300])
-        else:
-            log.info("ParkWhiz Teams posted mode=%s card_as_string=%s", mode, PARKWHIZ_TEAMS_CARD_AS_STRING)
+            return False
+        log.info("ParkWhiz Teams posted mode=%s card_as_string=%s", mode, PARKWHIZ_TEAMS_CARD_AS_STRING)
+        return True
     except Exception as e:
         log.warning("ParkWhiz Teams post failed: %s", e)
+        return False
 
 
 def _teams_text_summary(result: ProcessResult, tz_name: str) -> str:
@@ -639,14 +642,22 @@ _PERMANENT_SKIP_REASONS = frozenset({
 })
 
 
-def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
-    """Skip only when inventory was applied or failure is permanent."""
+def _skip_message_reason(state: Dict[str, Any], message_id: str) -> Optional[str]:
+    """Return why a message is skipped, or None if it should be processed."""
     rec = (state.get("by_id") or {}).get(str(message_id))
     if not rec:
-        return False
+        return None
     if rec.get("applied"):
-        return True
-    return str(rec.get("reason") or "") in _PERMANENT_SKIP_REASONS
+        return "inventory_already_applied"
+    reason = str(rec.get("reason") or "")
+    if reason in _PERMANENT_SKIP_REASONS:
+        return reason
+    return None
+
+
+def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
+    """Skip only when inventory was applied or failure is permanent."""
+    return _skip_message_reason(state, message_id) is not None
 
 
 def _should_send_teams(state: Dict[str, Any], message_id: str, result: ProcessResult) -> bool:
@@ -812,12 +823,13 @@ def _finalize_result(
     teams_sent = False
     if _should_send_teams(state, result.message_id, result):
         summary = _teams_text_summary(result, tz_name)
-        _post_parkwhiz_teams_card(
+        teams_sent = _post_parkwhiz_teams_card(
             build_parkwhiz_review_card(result=result, tz_name=tz_name),
             text_summary=summary,
             result=result,
         )
-        teams_sent = True
+        if not teams_sent:
+            log.warning("ParkWhiz Teams card was not delivered for msg=%s (will retry next poll)", result.message_id)
     else:
         log.info("ParkWhiz Teams skipped for msg=%s (already notified)", result.message_id)
 
@@ -852,6 +864,15 @@ def run_parkwhiz_poll(
         "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d done=%d workers=%d",
         query, len(message_ids), len(pending), len(processed_done), PARKWHIZ_MAX_WORKERS,
     )
+    for mid in message_ids:
+        if mid in pending:
+            continue
+        skip_reason = _skip_message_reason(state, mid) or "unknown"
+        rec = (state.get("by_id") or {}).get(str(mid)) or {}
+        log.info(
+            "ParkWhiz skip msg=%s reason=%s applied=%s teams_sent=%s prior_reason=%s",
+            mid, skip_reason, rec.get("applied"), rec.get("teams_sent"), rec.get("reason"),
+        )
 
     if not pending:
         return results

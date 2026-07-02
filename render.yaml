@@ -45,6 +45,8 @@ services:
         value: "America/Chicago"
       - key: SH_UPDATE_MAX_CONCURRENCY
         value: "2"
+      - key: SH_UPDATE_BATCH_SIZE
+        value: "75"
       - key: SH_UPDATE_PAUSE_SEC
         value: "0.25"
       - key: SH_UPDATE_JITTER_SEC
@@ -82,6 +84,6 @@ services:
         value: "false"
         # MUST stay false for Power Automate — true shows raw JSON text in Teams
       - key: PARKWHIZ_MAX_WORKERS
-        value: "3"
+        value: "1"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL
         sync: false

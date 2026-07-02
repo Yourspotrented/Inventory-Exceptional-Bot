@@ -61,6 +61,7 @@ class Settings(BaseModel):
 
     # pacing (a little slower + smooth)
     SH_UPDATE_MAX_CONCURRENCY: int = int(os.getenv("SH_UPDATE_MAX_CONCURRENCY", "2"))   # was 3 → 2
+    SH_UPDATE_BATCH_SIZE: int = int(os.getenv("SH_UPDATE_BATCH_SIZE", "75"))            # limit pending asyncio tasks
     SH_UPDATE_PAUSE_SEC: float = float(os.getenv("SH_UPDATE_PAUSE_SEC", "0.25"))        # was 0.2 → 0.25
     SH_UPDATE_JITTER_SEC: float = float(os.getenv("SH_UPDATE_JITTER_SEC", "0.15"))      # NEW: 0–150ms extra
 
@@ -365,24 +366,34 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
                     continue
 
             log.info(
-                "SH updater: batch start facilities=%d (dry_run=%s debug=%s conc=%d).",
-                len(fids), settings.SH_UPDATE_DRY_RUN, settings.SH_UPDATE_DEBUG, max_conc
+                "SH updater: batch start facilities=%d (dry_run=%s debug=%s conc=%d batch=%d).",
+                len(fids), settings.SH_UPDATE_DRY_RUN, settings.SH_UPDATE_DEBUG, max_conc,
+                max(10, settings.SH_UPDATE_BATCH_SIZE),
             )
 
-            # schedule tasks with small pacing
-            tasks: List[asyncio.Task] = []
-            for fid in fids:
-                tasks.append(asyncio.create_task(_one(fid, flex)))
-                await asyncio.sleep(max(0.0, settings.SH_UPDATE_PAUSE_SEC))
+            app.state.sh_batch_running = True
+            try:
+                ok = 0
+                failed = 0
+                batch_size = max(10, int(settings.SH_UPDATE_BATCH_SIZE))
+                for offset in range(0, len(fids), batch_size):
+                    batch = fids[offset: offset + batch_size]
+                    tasks: List[asyncio.Task] = []
+                    for fid in batch:
+                        tasks.append(asyncio.create_task(_one(fid, flex)))
+                        await asyncio.sleep(max(0.0, settings.SH_UPDATE_PAUSE_SEC))
+                    done = await asyncio.gather(*tasks, return_exceptions=False)
+                    ok += sum(1 for r in done if r)
+                    failed += sum(1 for r in done if not r)
+            finally:
+                app.state.sh_batch_running = False
 
-            done = await asyncio.gather(*tasks, return_exceptions=False)
-            ok = sum(1 for r in done if r)
-            failed = len(done) - ok
             dur = int(time.time() - started)
             log.info("SH updater: done ok=%d failed=%d duration=%ss", ok, failed, dur)
 
         except Exception as e:
             log.warning("SH updater: batch failed early: %s", e)
+            app.state.sh_batch_running = False
 
         # sleep until next cycle
         try:
@@ -431,35 +442,38 @@ async def parkwhiz_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
 
     while not stop_evt.is_set():
         try:
-            headers = await TOKEN_MGR.ensure_fresh()
-            flex = headers.get("flex_auth") or ""
-            if not flex:
-                raise RuntimeError("ParkWhiz: missing flex_auth")
-
-            # Fast path: use in-memory facilities cache (no network wait during SH batch)
-            items = list(getattr(app.state, "facilities", None) or [])
-            if not items:
-                items = await load_facilities_cache(app, force=False)
-
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                PARKWHIZ_EXECUTOR,
-                functools.partial(
-                    run_parkwhiz_poll,
-                    gmail=gmail,
-                    query=settings.GMAIL_QUERY,
-                    auth_token=flex,
-                    facilities=items,
-                    tz_name=settings.SH_UPDATE_TZ,
-                    dry_run=settings.PARKWHIZ_DRY_RUN,
-                    debug=settings.PARKWHIZ_DEBUG,
-                ),
-            )
-            if results:
-                applied = sum(1 for r in results if r.inventory_applied)
-                log.info("ParkWhiz poll: processed=%d inventory_applied=%d", len(results), applied)
+            if getattr(app.state, "sh_batch_running", False):
+                log.debug("ParkWhiz poll deferred (SH updater batch running)")
             else:
-                log.debug("ParkWhiz poll: no new messages")
+                headers = await TOKEN_MGR.ensure_fresh()
+                flex = headers.get("flex_auth") or ""
+                if not flex:
+                    raise RuntimeError("ParkWhiz: missing flex_auth")
+
+                # Fast path: use in-memory facilities cache (no network wait during SH batch)
+                items = list(getattr(app.state, "facilities", None) or [])
+                if not items:
+                    items = await load_facilities_cache(app, force=False)
+
+                loop = asyncio.get_running_loop()
+                results = await loop.run_in_executor(
+                    PARKWHIZ_EXECUTOR,
+                    functools.partial(
+                        run_parkwhiz_poll,
+                        gmail=gmail,
+                        query=settings.GMAIL_QUERY,
+                        auth_token=flex,
+                        facilities=items,
+                        tz_name=settings.SH_UPDATE_TZ,
+                        dry_run=settings.PARKWHIZ_DRY_RUN,
+                        debug=settings.PARKWHIZ_DEBUG,
+                    ),
+                )
+                if results:
+                    applied = sum(1 for r in results if r.inventory_applied)
+                    log.info("ParkWhiz poll: processed=%d inventory_applied=%d", len(results), applied)
+                else:
+                    log.debug("ParkWhiz poll: no new messages")
         except Exception as e:
             log.warning("ParkWhiz poll failed: %s", e, exc_info=settings.PARKWHIZ_DEBUG)
 
@@ -477,6 +491,7 @@ async def lifespan(app: FastAPI):
     app.state.facilities: List[Dict[str, str]] = []
     app.state.facilities_loaded_at: Optional[float] = None
     app.state.facilities_last_status: str = "MISS"
+    app.state.sh_batch_running: bool = False
     app.state.token_ready = asyncio.Event()
     tasks: List[asyncio.Task] = []
 
@@ -562,6 +577,7 @@ async def healthz():
             "tz": settings.SH_UPDATE_TZ,
             "pause_sec": settings.SH_UPDATE_PAUSE_SEC,
             "max_concurrency": settings.SH_UPDATE_MAX_CONCURRENCY,
+            "batch_size": settings.SH_UPDATE_BATCH_SIZE,
         },
         "parkwhiz": {
             "enabled": settings.PARKWHIZ_ENABLED and (run_parkwhiz_poll is not None),

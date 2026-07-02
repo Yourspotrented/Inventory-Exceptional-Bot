@@ -677,6 +677,16 @@ _DONE_SKIP_REASONS = frozenset({
 })
 
 
+def _notified_confirmations(state: Dict[str, Any]) -> set:
+    """Confirmation numbers that already received a Teams card."""
+    out = {str(x) for x in (state.get("notified_confirmations") or []) if x}
+    for rec in (state.get("by_id") or {}).values():
+        conf = str(rec.get("confirmation") or "").strip()
+        if conf and rec.get("teams_sent"):
+            out.add(conf)
+    return out
+
+
 def _skip_message_reason(state: Dict[str, Any], message_id: str) -> Optional[str]:
     """Return why a message is skipped, or None if it should be processed."""
     rec = (state.get("by_id") or {}).get(str(message_id))
@@ -684,11 +694,16 @@ def _skip_message_reason(state: Dict[str, Any], message_id: str) -> Optional[str
         return None
     if rec.get("applied"):
         return "inventory_already_applied"
+    if rec.get("teams_sent"):
+        return "teams_already_sent"
     reason = str(rec.get("reason") or "")
     if reason in _PERMANENT_SKIP_REASONS:
         return reason
     if reason in _DONE_SKIP_REASONS:
         return reason
+    conf = str(rec.get("confirmation") or "").strip()
+    if conf and conf in _notified_confirmations(state):
+        return "confirmation_already_notified"
     return None
 
 
@@ -698,9 +713,18 @@ def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
 
 
 def _should_send_teams(state: Dict[str, Any], message_id: str, result: ProcessResult) -> bool:
-    """One Teams card per Gmail message — never resend."""
+    """One Teams card per Gmail message and per ParkWhiz confirmation number."""
     rec = (state.get("by_id") or {}).get(str(message_id)) or {}
-    return not rec.get("teams_sent")
+    if rec.get("teams_sent"):
+        return False
+    conf = (result.parsed.confirmation_number or "").strip()
+    if conf and conf in _notified_confirmations(state):
+        log.info(
+            "ParkWhiz Teams skipped for msg=%s confirmation=%s (duplicate reservation email)",
+            message_id, conf,
+        )
+        return False
+    return True
 
 
 def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams_sent: bool = False) -> None:
@@ -719,9 +743,18 @@ def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams
         "teams_sent": bool(prev.get("teams_sent")) or bool(teams_sent),
         "confirmation": result.parsed.confirmation_number or prev.get("confirmation"),
     }
+    conf = str(by_id[mid].get("confirmation") or "").strip()
+    if teams_sent and conf:
+        notified = [str(x) for x in (state.get("notified_confirmations") or []) if x]
+        if conf not in notified:
+            notified.append(conf)
+        state["notified_confirmations"] = notified[-500:]
     done_ids = [
         mid for mid, r in by_id.items()
-        if r.get("applied") or r.get("reason") in _PERMANENT_SKIP_REASONS or r.get("reason") in _DONE_SKIP_REASONS
+        if r.get("applied")
+        or r.get("teams_sent")
+        or r.get("reason") in _PERMANENT_SKIP_REASONS
+        or r.get("reason") in _DONE_SKIP_REASONS
     ]
     state["processed_ids"] = done_ids[-500:]
 
@@ -729,7 +762,7 @@ def _record_message_state(state: Dict[str, Any], result: ProcessResult, *, teams
 def _load_state(path: str) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
-        return {"processed_ids": [], "by_id": {}}
+        return {"processed_ids": [], "by_id": {}, "notified_confirmations": []}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -737,10 +770,12 @@ def _load_state(path: str) -> Dict[str, Any]:
                 data["by_id"] = {}
             if not isinstance(data.get("processed_ids"), list):
                 data["processed_ids"] = []
+            if not isinstance(data.get("notified_confirmations"), list):
+                data["notified_confirmations"] = []
             return data
     except Exception:
         pass
-    return {"processed_ids": [], "by_id": {}}
+    return {"processed_ids": [], "by_id": {}, "notified_confirmations": []}
 
 
 def _save_state(path: str, state: Dict[str, Any]) -> None:
@@ -875,7 +910,16 @@ def _finalize_result(
         if not teams_sent:
             log.warning("ParkWhiz Teams card was not delivered for msg=%s (will retry next poll)", result.message_id)
     else:
-        log.info("ParkWhiz Teams skipped for msg=%s (already notified)", result.message_id)
+        conf = (result.parsed.confirmation_number or "").strip()
+        rec = (state.get("by_id") or {}).get(str(result.message_id)) or {}
+        if not rec.get("teams_sent") and conf and conf in _notified_confirmations(state):
+            teams_sent = True
+            log.info(
+                "ParkWhiz Teams skipped for msg=%s — duplicate email for confirmation %s",
+                result.message_id, conf,
+            )
+        else:
+            log.info("ParkWhiz Teams skipped for msg=%s (already notified)", result.message_id)
 
     _record_message_state(state, result, teams_sent=teams_sent)
 

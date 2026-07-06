@@ -134,10 +134,18 @@ def _coerce_json(r: httpx.Response) -> Any:
 
 _SUFFIX_RX = re.compile(r"\s*-\s*(?:garage|lot|deck)\b", re.I)
 _WS_RX = re.compile(r"\s+")
+# Unicode dashes/hyphens (en-dash, em-dash, minus, etc.)
+_DASH_CHARS_RX = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]")
+# Spot/address ranges: "#21 - 36", "#21–36", "15-17" → "21 36", "15 17"
+_DIGIT_RANGE_RX = re.compile(r"(\d+)\s*-\s*(\d+)")
+
 
 def _norm(s: str) -> str:
     t = (s or "").strip().lower()
-    t = t.replace("–", "-").replace("—", "-").replace("\u00a0", " ")
+    t = _DASH_CHARS_RX.sub("-", t)
+    t = t.replace("\u00a0", " ")
+    # Unify numeric ranges before stripping punctuation (#21-36 vs #21 - 36)
+    t = _DIGIT_RANGE_RX.sub(r"\1 \2", t)
     t = _SUFFIX_RX.sub("", t)
     t = re.sub(r"[^\w\s&/]", " ", t)
     t = _WS_RX.sub(" ", t).strip()

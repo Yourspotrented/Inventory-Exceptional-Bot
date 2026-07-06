@@ -113,13 +113,21 @@ def _parse_dt(text: str, tz_name: str, default_year: Optional[int] = None) -> Op
         return None
 
 
+def _clean_facility_name(name: str) -> str:
+    """Normalize facility text extracted from ParkWhiz email (unicode dashes, spacing)."""
+    t = (name or "").strip()
+    t = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]", "-", t)
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
 def _extract_facility(subject: str, body: str) -> str:
     m = _SUBJECT_FACILITY_RE.search(subject or "")
     if m:
-        return m.group(1).strip()
+        return _clean_facility_name(m.group(1))
     m = _BODY_FACILITY_RE.search(body or "")
     if m:
-        return m.group(1).strip()
+        return _clean_facility_name(m.group(1))
     return ""
 
 

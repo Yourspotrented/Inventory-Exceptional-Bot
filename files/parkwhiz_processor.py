@@ -17,6 +17,7 @@ from dateutil import parser as date_parser
 from zoneinfo import ZoneInfo
 
 from files.facilities import best_match_from_list
+from files.parkwhiz_allowlist import match_allowlist_name
 from files.gmail_client import (
     GmailClient,
     extract_headers,
@@ -669,6 +670,7 @@ def build_parkwhiz_review_card(
 _PERMANENT_SKIP_REASONS = frozenset({
     "facility_not_found_in_email",
     "time_parse_failed",
+    "facility_not_in_allowlist",
 })
 
 # Inventory already at target — no further action needed
@@ -714,6 +716,8 @@ def _should_skip_message(state: Dict[str, Any], message_id: str) -> bool:
 
 def _should_send_teams(state: Dict[str, Any], message_id: str, result: ProcessResult) -> bool:
     """One Teams card per Gmail message and per ParkWhiz confirmation number."""
+    if result.inventory_skipped_reason in {"facility_not_in_allowlist"}:
+        return False
     rec = (state.get("by_id") or {}).get(str(message_id)) or {}
     if rec.get("teams_sent"):
         return False
@@ -792,6 +796,7 @@ def process_parkwhiz_message(
     message_id: str,
     auth_token: str,
     facilities: List[Dict[str, Any]],
+    allowlist: Optional[List[str]] = None,
     tz_name: str = DEFAULT_TZ,
     dry_run: bool = False,
     debug: bool = False,
@@ -814,6 +819,17 @@ def process_parkwhiz_message(
         result.inventory_skipped_reason = "time_parse_failed"
         result.error = "; ".join(parsed.parse_notes) or "Time/date not recognized"
         return result
+
+    if allowlist is not None:
+        allowed = match_allowlist_name(parsed.facility_name, allowlist)
+        if not allowed:
+            result.inventory_skipped_reason = "facility_not_in_allowlist"
+            result.error = f"Facility not in ParkWhiz allowlist: {parsed.facility_name}"
+            log.info(
+                "[PARKWHIZ] skip allowlist msg=%s facility=%r (allowlist_size=%d)",
+                message_id, parsed.facility_name, len(allowlist),
+            )
+            return result
 
     match = best_match_from_list(parsed.facility_name, facilities)
     if not match:
@@ -877,6 +893,7 @@ def _process_one(
     message_id: str,
     auth_token: str,
     facilities: List[Dict[str, Any]],
+    allowlist: Optional[List[str]],
     tz_name: str,
     dry_run: bool,
     debug: bool,
@@ -886,6 +903,7 @@ def _process_one(
         message_id=message_id,
         auth_token=auth_token,
         facilities=facilities,
+        allowlist=allowlist,
         tz_name=tz_name,
         dry_run=dry_run,
         debug=debug,
@@ -923,7 +941,7 @@ def _finalize_result(
 
     _record_message_state(state, result, teams_sent=teams_sent)
 
-    if result.inventory_applied:
+    if result.inventory_applied or result.inventory_skipped_reason in _PERMANENT_SKIP_REASONS:
         try:
             gmail.mark_as_read(result.message_id)
         except Exception as e:
@@ -936,6 +954,7 @@ def run_parkwhiz_poll(
     query: str,
     auth_token: str,
     facilities: List[Dict[str, Any]],
+    allowlist: Optional[List[str]] = None,
     tz_name: str = DEFAULT_TZ,
     dry_run: bool = False,
     debug: bool = False,
@@ -949,8 +968,9 @@ def run_parkwhiz_poll(
     message_ids = gmail.list_message_ids(query, max_results=max_messages)
     pending = [mid for mid in message_ids if not _should_skip_message(state, mid)]
     log.info(
-        "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d done=%d workers=%d",
+        "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d done=%d workers=%d allowlist=%s",
         query, len(message_ids), len(pending), len(processed_done), PARKWHIZ_MAX_WORKERS,
+        len(allowlist) if allowlist is not None else "off",
     )
     for mid in message_ids:
         if mid in pending:
@@ -968,7 +988,7 @@ def run_parkwhiz_poll(
     if len(pending) == 1:
         pending_results = [_process_one(
             gmail=gmail, message_id=pending[0], auth_token=auth_token,
-            facilities=facilities, tz_name=tz_name, dry_run=dry_run, debug=debug,
+            facilities=facilities, allowlist=allowlist, tz_name=tz_name, dry_run=dry_run, debug=debug,
         )]
     else:
         pending_results = []
@@ -980,6 +1000,7 @@ def run_parkwhiz_poll(
                     message_id=mid,
                     auth_token=auth_token,
                     facilities=facilities,
+                    allowlist=allowlist,
                     tz_name=tz_name,
                     dry_run=dry_run,
                     debug=debug,

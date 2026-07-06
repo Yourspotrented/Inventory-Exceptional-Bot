@@ -78,6 +78,14 @@ class Settings(BaseModel):
     GOOGLE_REFRESH_TOKEN: str = (os.getenv("GOOGLE_REFRESH_TOKEN") or "").strip()
     PARKWHIZ_TEAMS_WEBHOOK_URL: str = (os.getenv("PARKWHIZ_TEAMS_WEBHOOK_URL") or "").strip()
 
+    # ParkWhiz facility allowlist from SharePoint Excel (only process listed facilities)
+    PARKWHIZ_ALLOWLIST_ENABLED: bool = (os.getenv("PARKWHIZ_ALLOWLIST_ENABLED", "true").lower() in {"1", "true", "yes"})
+    PARKWHIZ_FACILITIES_XLSX_PATH: str = (
+        os.getenv("PARKWHIZ_FACILITIES_XLSX_PATH")
+        or "Events Team/Automation/Parkwhiz Events Facilities.xlsx"
+    ).strip()
+    PARKWHIZ_ALLOWLIST_TTL_SECONDS: int = int(os.getenv("PARKWHIZ_ALLOWLIST_TTL_SECONDS", "3600"))
+
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 
@@ -185,6 +193,22 @@ class TokenManager:
             f.write(r.content)
         log.info("TokenManager: token.json saved (%d bytes)", len(r.content))
 
+    async def download_drive_file(self, sp_path: str) -> bytes:
+        """Download a file from SharePoint drive by path (same Graph creds as token.json)."""
+        if not _have_graph_envs():
+            raise RuntimeError("GRAPH_* envs required for SharePoint file download")
+        token = await self._get_graph_app_token()
+        path = (sp_path or "").strip().lstrip("/")
+        url = (
+            f"https://graph.microsoft.com/v1.0/sites/{settings.SP_SITE_ID}"
+            f"/drives/{settings.SP_DRIVE_ID}/root:/{path}:/content"
+        )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), trust_env=True) as client:
+            r = await client.get(url, headers={"Authorization": f"Bearer {token}"}, follow_redirects=True)
+        if r.status_code != 200:
+            raise RuntimeError(f"Graph download failed for {path!r}: {r.status_code} {r.text[:200]}")
+        return r.content
+
     async def _get_graph_app_token(self) -> str:
         if not _have_graph_envs():
             raise RuntimeError("GRAPH_* envs required for token.json download")
@@ -234,9 +258,11 @@ except ModuleNotFoundError:
 try:
     from files.gmail_client import GmailClient
     from files.parkwhiz_processor import run_parkwhiz_poll
+    from files.parkwhiz_allowlist import parse_allowlist_xlsx
 except ModuleNotFoundError:
     GmailClient = None  # type: ignore
     run_parkwhiz_poll = None  # type: ignore
+    parse_allowlist_xlsx = None  # type: ignore
 
 # ----------------------------- Facilities cache -----------------------
 async def load_facilities_cache(app: FastAPI, force: bool = False) -> List[Dict[str, str]]:
@@ -260,6 +286,38 @@ async def load_facilities_cache(app: FastAPI, force: bool = False) -> List[Dict[
     app.state.facilities_last_status = "MISS"
     log.info("Facilities cache loaded: %d items", len(app.state.facilities))
     return app.state.facilities
+
+
+async def load_parkwhiz_allowlist_cache(app: FastAPI, *, force: bool = False) -> List[str]:
+    """Load ParkWhiz facility allowlist from SharePoint Excel; cached with TTL."""
+    if not settings.PARKWHIZ_ALLOWLIST_ENABLED or parse_allowlist_xlsx is None:
+        return []
+
+    if not _have_graph_envs():
+        log.warning("ParkWhiz allowlist: Graph envs missing; allowlist empty")
+        return []
+
+    if not force:
+        loaded_at = getattr(app.state, "parkwhiz_allowlist_loaded_at", None)
+        cached = getattr(app.state, "parkwhiz_allowlist", None)
+        if isinstance(cached, list) and loaded_at:
+            age = time.time() - loaded_at
+            if age < max(60, settings.PARKWHIZ_ALLOWLIST_TTL_SECONDS):
+                return cached
+
+    try:
+        raw = await TOKEN_MGR.download_drive_file(settings.PARKWHIZ_FACILITIES_XLSX_PATH)
+        names = parse_allowlist_xlsx(raw)
+        app.state.parkwhiz_allowlist = names
+        app.state.parkwhiz_allowlist_loaded_at = time.time()
+        log.info(
+            "ParkWhiz allowlist loaded: %d facilities from %r",
+            len(names), settings.PARKWHIZ_FACILITIES_XLSX_PATH,
+        )
+        return names
+    except Exception as e:
+        log.warning("ParkWhiz allowlist load failed: %s", e)
+        return list(getattr(app.state, "parkwhiz_allowlist", None) or [])
 
 # ----------------------------- Background refresh ---------------------
 async def refresh_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
@@ -455,25 +513,35 @@ async def parkwhiz_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
                 if not items:
                     items = await load_facilities_cache(app, force=False)
 
-                loop = asyncio.get_running_loop()
-                results = await loop.run_in_executor(
-                    PARKWHIZ_EXECUTOR,
-                    functools.partial(
-                        run_parkwhiz_poll,
-                        gmail=gmail,
-                        query=settings.GMAIL_QUERY,
-                        auth_token=flex,
-                        facilities=items,
-                        tz_name=settings.SH_UPDATE_TZ,
-                        dry_run=settings.PARKWHIZ_DRY_RUN,
-                        debug=settings.PARKWHIZ_DEBUG,
-                    ),
-                )
-                if results:
-                    applied = sum(1 for r in results if r.inventory_applied)
-                    log.info("ParkWhiz poll: processed=%d inventory_applied=%d", len(results), applied)
-                else:
-                    log.debug("ParkWhiz poll: no new messages")
+                allowlist: List[str] = []
+                run_poll = True
+                if settings.PARKWHIZ_ALLOWLIST_ENABLED:
+                    allowlist = await load_parkwhiz_allowlist_cache(app, force=False)
+                    if not allowlist:
+                        log.warning("ParkWhiz poll skipped: allowlist enabled but empty/unavailable")
+                        run_poll = False
+
+                if run_poll:
+                    loop = asyncio.get_running_loop()
+                    results = await loop.run_in_executor(
+                        PARKWHIZ_EXECUTOR,
+                        functools.partial(
+                            run_parkwhiz_poll,
+                            gmail=gmail,
+                            query=settings.GMAIL_QUERY,
+                            auth_token=flex,
+                            facilities=items,
+                            allowlist=allowlist if settings.PARKWHIZ_ALLOWLIST_ENABLED else None,
+                            tz_name=settings.SH_UPDATE_TZ,
+                            dry_run=settings.PARKWHIZ_DRY_RUN,
+                            debug=settings.PARKWHIZ_DEBUG,
+                        ),
+                    )
+                    if results:
+                        applied = sum(1 for r in results if r.inventory_applied)
+                        log.info("ParkWhiz poll: processed=%d inventory_applied=%d", len(results), applied)
+                    else:
+                        log.debug("ParkWhiz poll: no new messages")
         except Exception as e:
             log.warning("ParkWhiz poll failed: %s", e, exc_info=settings.PARKWHIZ_DEBUG)
 
@@ -492,6 +560,8 @@ async def lifespan(app: FastAPI):
     app.state.facilities_loaded_at: Optional[float] = None
     app.state.facilities_last_status: str = "MISS"
     app.state.sh_batch_running: bool = False
+    app.state.parkwhiz_allowlist: List[str] = []
+    app.state.parkwhiz_allowlist_loaded_at: Optional[float] = None
     app.state.token_ready = asyncio.Event()
     tasks: List[asyncio.Task] = []
 
@@ -503,6 +573,8 @@ async def lifespan(app: FastAPI):
             await TOKEN_MGR.ensure_fresh()
         app.state.token_ready.set()
         await load_facilities_cache(app, force=True)
+        if settings.PARKWHIZ_ENABLED and settings.PARKWHIZ_ALLOWLIST_ENABLED:
+            await load_parkwhiz_allowlist_cache(app, force=True)
         log.info("Startup warm: token + facilities ready.")
     except Exception as e:
         log.warning("Startup warm failed: %s", e)
@@ -587,6 +659,13 @@ async def healthz():
             "gmail_envs_present": _have_gmail_envs(),
             "gmail_query": settings.GMAIL_QUERY,
             "teams_webhook_configured": bool(settings.PARKWHIZ_TEAMS_WEBHOOK_URL),
+            "allowlist_enabled": settings.PARKWHIZ_ALLOWLIST_ENABLED,
+            "allowlist_path": settings.PARKWHIZ_FACILITIES_XLSX_PATH,
+            "allowlist_count": len(getattr(app.state, "parkwhiz_allowlist", []) or []),
+            "allowlist_age_sec": (
+                int(time.time() - app.state.parkwhiz_allowlist_loaded_at)
+                if getattr(app.state, "parkwhiz_allowlist_loaded_at", None) else None
+            ),
         },
     }
     return {"ok": True, "meta": meta}

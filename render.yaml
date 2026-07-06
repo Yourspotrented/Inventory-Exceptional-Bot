@@ -87,3 +87,9 @@ services:
         value: "1"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL
         sync: false
+      - key: PARKWHIZ_ALLOWLIST_ENABLED
+        value: "true"
+      - key: PARKWHIZ_FACILITIES_XLSX_PATH
+        value: "Events Team/Automation/Parkwhiz Events Facilities.xlsx"
+      - key: PARKWHIZ_ALLOWLIST_TTL_SECONDS
+        value: "3600"

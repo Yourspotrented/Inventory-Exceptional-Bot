@@ -14,7 +14,9 @@ from files.facilities import _norm, _score, best_match_from_list
 log = logging.getLogger("app.parkwhiz.allowlist")
 
 _NAME_COLUMNS = frozenset({"FACILITY NAME", "FACILITY", "FACILITY_NAME", "NAME"})
-_ALLOWLIST_MIN_SCORE = 0.40
+# Strict threshold — avoids false positives like "10 Soden St" matching "62 Queensberry St"
+_ALLOWLIST_MIN_SCORE = 0.72
+_ADDRESS_PREFIX_RE = re.compile(r"^(\d+(?:\s+\d+)?)")
 
 
 def _sanitize_facility_text(name: str) -> str:
@@ -23,6 +25,13 @@ def _sanitize_facility_text(name: str) -> str:
     t = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]", "-", t)
     t = re.sub(r"\s+", " ", t)
     return t
+
+
+def _address_prefix(name: str) -> str:
+    """Leading street number(s), e.g. '10', '15 17', '1025'."""
+    n = _norm(name)
+    m = _ADDRESS_PREFIX_RE.match(n)
+    return m.group(1) if m else ""
 
 
 def parse_allowlist_xlsx(data: bytes) -> List[str]:
@@ -61,20 +70,28 @@ def match_allowlist_name(email_facility: str, allowlist: List[str]) -> Optional[
         if _norm(name) == ne:
             return name
 
-    facs = [{"id": i, "name": n} for i, n in enumerate(allowlist)]
-    hit = best_match_from_list(email_facility, facs)
-    if hit:
-        return str(hit["name"])
+    email_prefix = _address_prefix(email_facility)
+    candidates = allowlist
+    if email_prefix:
+        same_street = [n for n in allowlist if _address_prefix(n) == email_prefix]
+        if same_street:
+            candidates = same_street
 
-    best_sc, best_name = 0.0, None
-    for name in allowlist:
-        sc = _score(email_facility, name)
-        if sc > best_sc:
-            best_sc, best_name = sc, name
-    if best_sc >= _ALLOWLIST_MIN_SCORE and best_name:
-        log.info(
-            "ParkWhiz allowlist fuzzy match email=%r -> sheet=%r score=%.2f",
-            email_facility[:80], best_name[:80], best_sc,
-        )
-        return best_name
+    facs = [{"id": i, "name": n} for i, n in enumerate(candidates)]
+    hit = best_match_from_list(email_facility, facs, min_score=_ALLOWLIST_MIN_SCORE)
+    if hit:
+        matched = str(hit["name"])
+        if email_prefix and _address_prefix(matched) != email_prefix:
+            log.warning(
+                "ParkWhiz allowlist rejected prefix mismatch email=%r matched=%r",
+                email_facility[:80], matched[:80],
+            )
+            return None
+        if float(hit.get("score") or 0) < 1.0:
+            log.info(
+                "ParkWhiz allowlist fuzzy match email=%r -> sheet=%r score=%s",
+                email_facility[:80], matched[:80], hit.get("score"),
+            )
+        return matched
+
     return None

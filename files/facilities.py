@@ -46,11 +46,16 @@ async def resolve_facility(res_facility_name: str, flex_auth: str) -> Optional[D
         return None
     return _best_facility_match(res_facility_name, facilities)
 
-def best_match_from_list(target_name: str, facilities_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def best_match_from_list(
+    target_name: str,
+    facilities_list: List[Dict[str, Any]],
+    *,
+    min_score: float = 0.45,
+) -> Optional[Dict[str, Any]]:
     """Match against a provided in-memory list only."""
     if not facilities_list:
         return None
-    return _best_facility_match(target_name, facilities_list)
+    return _best_facility_match(target_name, facilities_list, min_score=min_score)
 
 # --------------------------- Network -----------------------------------
 
@@ -170,7 +175,12 @@ def _score(a: str, b: str) -> float:
         bonus += 0.2
     return min(1.0, base + bonus)
 
-def _best_facility_match(target_name: str, facilities: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _best_facility_match(
+    target_name: str,
+    facilities: List[Dict[str, Any]],
+    *,
+    min_score: float = 0.45,
+) -> Optional[Dict[str, Any]]:
     tn = _norm(target_name)
     # exact-normalized equality shortcut
     for f in facilities:
@@ -185,7 +195,7 @@ def _best_facility_match(target_name: str, facilities: List[Dict[str, Any]]) -> 
         if not name:
             continue
         sc = _score(tn, name)
-        if sc < 0.45:
+        if sc < min_score:
             continue
         dist = abs(len(_norm(name)) - len(tn))
         cand = (sc, -dist, {"id": fid, "name": name, "score": round(sc, 3)})

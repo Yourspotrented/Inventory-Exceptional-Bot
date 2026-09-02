@@ -18,7 +18,7 @@ def getAllFacilities(auth_token: str, url: str) -> pd.DataFrame:
         "offset": 0,
         "filters": {
             "cities": [],
-            "status": ["On", "Archived", "Off"]
+            "status": ["On"]
         },
         "facility_ids": "",
         "operator_email": ""

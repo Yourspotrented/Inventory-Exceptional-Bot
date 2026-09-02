@@ -16,19 +16,46 @@ log = logging.getLogger("app.facilities")
 # SpotHero operator facility search endpoint (requires POST)
 FACILITIES_URL = "https://spothero.com/api/v1/facilities/operator-facility-search/"
 
+# Only active operator facilities (excludes Archived / Off from search results).
+_FACILITY_SEARCH_STATUSES = ["On"]
+_ARCHIVED_TITLE_RX = re.compile(r"\(archived\)", re.I)
+_INACTIVE_STATUS = frozenset({"archived", "off"})
+
+
+def _spot_is_active(spot: Dict[str, Any], fac: Dict[str, Any]) -> bool:
+    """Keep only On facilities; drop archived/off even if returned by API."""
+    title = str(spot.get("title") or "")
+    if _ARCHIVED_TITLE_RX.search(title):
+        return False
+    for src in (spot, fac):
+        for key in ("status", "facility_status", "reservation_status"):
+            raw = src.get(key)
+            if raw is None:
+                continue
+            if str(raw).strip().lower() in _INACTIVE_STATUS:
+                return False
+    return True
+
 # --------------------------- Public API --------------------------------
 
 async def fetch_all_facilities(flex_auth: str) -> List[Dict[str, Any]]:
-    """Return normalized list of {'id','name'} from parking_spots[]."""
+    """Return normalized list of active On facilities from parking_spots[]."""
     raw_facilities = await _fetch_all_facilities_post(flex_auth)
     out: List[Dict[str, Any]] = []
+    skipped = 0
     for fac in raw_facilities:
         for spot in fac.get("parking_spots", []) or []:
+            if not _spot_is_active(spot, fac):
+                skipped += 1
+                continue
             fid = spot.get("id")
             title = spot.get("title")
             if fid is not None and title:
-                out.append({"id": fid, "name": str(title).strip()})
-    log.info("facilities: normalized %d items", len(out))
+                row: Dict[str, Any] = {"id": fid, "name": str(title).strip()}
+                if "event_tiering_enabled" in spot:
+                    row["eventTieringEnabled"] = bool(spot.get("event_tiering_enabled"))
+                out.append(row)
+    log.info("facilities: normalized %d active On items (skipped %d archived/off)", len(out), skipped)
     return out
 
 async def resolve_facility_with_token_mgr(res_facility_name: str, token_mgr) -> Optional[Dict[str, Any]]:
@@ -74,7 +101,7 @@ async def _fetch_all_facilities_post(flex_auth: str) -> List[Dict[str, Any]]:
         "offset": 0,
         "filters": {
             "cities": [],
-            "status": ["On", "Archived", "Off"],
+            "status": list(_FACILITY_SEARCH_STATUSES),
         },
         "facility_ids": "",
         "operator_email": "",

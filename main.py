@@ -65,6 +65,11 @@ class Settings(BaseModel):
     SH_UPDATE_PAUSE_SEC: float = float(os.getenv("SH_UPDATE_PAUSE_SEC", "0.25"))        # was 0.2 → 0.25
     SH_UPDATE_JITTER_SEC: float = float(os.getenv("SH_UPDATE_JITTER_SEC", "0.15"))      # NEW: 0–150ms extra
 
+    # Rolling rotation: process a small chunk continuously instead of one giant batch + long sleep.
+    SH_UPDATE_ROTATION_ENABLED: bool = (os.getenv("SH_UPDATE_ROTATION_ENABLED", "true").lower() in {"1", "true", "yes"})
+    SH_UPDATE_CHUNK_SIZE: int = int(os.getenv("SH_UPDATE_CHUNK_SIZE", "50"))            # facilities per rotation step
+    SH_UPDATE_CHUNK_PAUSE_SECONDS: int = int(os.getenv("SH_UPDATE_CHUNK_PAUSE_SECONDS", "600"))  # 10m between chunks
+
     # --- ParkWhiz Gmail reservation flow (separate from SH updater) ---
     PARKWHIZ_ENABLED: bool = (os.getenv("PARKWHIZ_ENABLED", "false").lower() in {"1", "true", "yes"})
     PARKWHIZ_POLL_INTERVAL_SECONDS: int = int(os.getenv("PARKWHIZ_POLL_INTERVAL_SECONDS", "10"))
@@ -347,32 +352,35 @@ async def refresh_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
 
-# ------------------ Tiered-event updater (every 4h, threaded) --------
+# ------------------ Tiered-event updater (rolling rotation or batch) --
 async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
     """
-    Runs every SH_UPDATE_INTERVAL_SECONDS (default 4h).
-    Offloads blocking work to threads; bounded concurrency.
+    SpotHero IE updater. When rotation is enabled (default), processes a small
+    chunk of facilities every SH_UPDATE_CHUNK_PAUSE_SECONDS and cycles through
+    the full fleet continuously. Otherwise runs one full batch then sleeps
+    SH_UPDATE_INTERVAL_SECONDS (legacy mode).
     """
     if not settings.SH_UPDATE_ENABLED or run_update_for_facility_all_rules is None:
         return
 
     await app.state.token_ready.wait()
-    interval = max(60, int(settings.SH_UPDATE_INTERVAL_SECONDS))
+    legacy_interval = max(60, int(settings.SH_UPDATE_INTERVAL_SECONDS))
+    rotation_enabled = settings.SH_UPDATE_ROTATION_ENABLED
+    chunk_size = max(1, int(settings.SH_UPDATE_CHUNK_SIZE))
+    chunk_pause = max(30, int(settings.SH_UPDATE_CHUNK_PAUSE_SECONDS))
 
-    # bounded concurrency for thread offloads
     max_conc = max(1, int(settings.SH_UPDATE_MAX_CONCURRENCY))
     sem = asyncio.Semaphore(max_conc)
-
-    # map reused by worker for nicer logs (id -> name)
     name_map: Dict[int, str] = {}
+    rotation_offset = 0
+    cached_fids: List[int] = []
 
     async def _one(fid: int, token: str) -> bool:
         async with sem:
             try:
-                # run the blocking requests client off-thread
                 await asyncio.to_thread(
                     run_update_for_facility_all_rules,
-                    auth_token=token,           # already "Bearer ..." from token.json
+                    auth_token=token,
                     facility_id=fid,
                     tz_name=settings.SH_UPDATE_TZ,
                     dry_run=settings.SH_UPDATE_DRY_RUN,
@@ -387,10 +395,51 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
                     log.info("SH updater: facility %s skipped: %s", fid, str(e)[:200])
                 return False
 
+    async def _process_fids(fids: List[int], flex: str) -> tuple[int, int]:
+        """Process facility IDs in sub-batches; returns (ok, failed)."""
+        ok = 0
+        failed = 0
+        batch_size = max(10, int(settings.SH_UPDATE_BATCH_SIZE))
+        app.state.sh_batch_running = True
+        try:
+            for offset in range(0, len(fids), batch_size):
+                batch = fids[offset: offset + batch_size]
+                tasks: List[asyncio.Task] = []
+                for fid in batch:
+                    tasks.append(asyncio.create_task(_one(fid, flex)))
+                    await asyncio.sleep(max(0.0, settings.SH_UPDATE_PAUSE_SEC))
+                done = await asyncio.gather(*tasks, return_exceptions=False)
+                ok += sum(1 for r in done if r)
+                failed += sum(1 for r in done if not r)
+        finally:
+            app.state.sh_batch_running = False
+        return ok, failed
+
+    def _select_rotation_chunk(all_fids: List[int], offset: int) -> tuple[List[int], int]:
+        """Return next chunk and updated offset (wraps at end of list)."""
+        n = len(all_fids)
+        if n == 0:
+            return [], 0
+        size = min(chunk_size, n)
+        chunk = [all_fids[(offset + i) % n] for i in range(size)]
+        new_offset = (offset + size) % n
+        return chunk, new_offset
+
+    if rotation_enabled:
+        log.info(
+            "SH updater: rotation mode chunk_size=%d pause=%ds conc=%d (full fleet cycles continuously).",
+            chunk_size, chunk_pause, max_conc,
+        )
+    else:
+        log.info(
+            "SH updater: legacy batch mode interval=%ds conc=%d batch=%d.",
+            legacy_interval, max_conc, max(10, settings.SH_UPDATE_BATCH_SIZE),
+        )
+
     while not stop_evt.is_set():
         started = time.time()
+        sleep_seconds = chunk_pause if rotation_enabled else legacy_interval
         try:
-            # fresh token & current facility cache
             headers = await TOKEN_MGR.ensure_fresh()
             flex = headers.get("flex_auth") or ""
             if not flex:
@@ -398,7 +447,6 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
 
             items = await load_facilities_cache(app, force=False)
 
-            # filter: ONLY_TIERED when explicit flag available; otherwise include
             if settings.SH_UPDATE_ONLY_TIERED:
                 fsel = [
                     it for it in items
@@ -407,55 +455,58 @@ async def sh_update_loop(app: FastAPI, stop_evt: asyncio.Event) -> None:
             else:
                 fsel = items
 
-            # (re)build name map for this batch without rebinding the dict
             name_map.clear()
+            fids: List[int] = []
             for it in fsel:
                 try:
                     fid_int = int(it.get("id"))
+                    fids.append(fid_int)
                     name_map[fid_int] = str(it.get("name") or "")
                 except Exception:
                     continue
 
-            fids: List[int] = []
-            for it in fsel:
-                try:
-                    fids.append(int(it.get("id")))
-                except Exception:
-                    continue
+            if rotation_enabled:
+                if fids != cached_fids:
+                    if cached_fids and fids:
+                        log.info("SH updater: facility list changed (%d → %d); rotation reset.", len(cached_fids), len(fids))
+                    cached_fids = list(fids)
+                    rotation_offset = 0
 
-            log.info(
-                "SH updater: batch start facilities=%d (dry_run=%s debug=%s conc=%d batch=%d).",
-                len(fids), settings.SH_UPDATE_DRY_RUN, settings.SH_UPDATE_DEBUG, max_conc,
-                max(10, settings.SH_UPDATE_BATCH_SIZE),
-            )
-
-            app.state.sh_batch_running = True
-            try:
-                ok = 0
-                failed = 0
-                batch_size = max(10, int(settings.SH_UPDATE_BATCH_SIZE))
-                for offset in range(0, len(fids), batch_size):
-                    batch = fids[offset: offset + batch_size]
-                    tasks: List[asyncio.Task] = []
-                    for fid in batch:
-                        tasks.append(asyncio.create_task(_one(fid, flex)))
-                        await asyncio.sleep(max(0.0, settings.SH_UPDATE_PAUSE_SEC))
-                    done = await asyncio.gather(*tasks, return_exceptions=False)
-                    ok += sum(1 for r in done if r)
-                    failed += sum(1 for r in done if not r)
-            finally:
-                app.state.sh_batch_running = False
-
-            dur = int(time.time() - started)
-            log.info("SH updater: done ok=%d failed=%d duration=%ss", ok, failed, dur)
+                if not fids:
+                    log.warning("SH updater: no facilities to process.")
+                else:
+                    chunk, rotation_offset = _select_rotation_chunk(fids, rotation_offset)
+                    wrapped = rotation_offset == 0
+                    log.info(
+                        "SH updater: rotation chunk start count=%d/%d offset_after=%d wrapped=%s "
+                        "(dry_run=%s debug=%s).",
+                        len(chunk), len(fids), rotation_offset, wrapped,
+                        settings.SH_UPDATE_DRY_RUN, settings.SH_UPDATE_DEBUG,
+                    )
+                    ok, failed = await _process_fids(chunk, flex)
+                    dur = int(time.time() - started)
+                    log.info(
+                        "SH updater: rotation chunk done ok=%d failed=%d duration=%ss wrapped=%s",
+                        ok, failed, dur, wrapped,
+                    )
+                    app.state.sh_rotation_offset = rotation_offset
+                    app.state.sh_rotation_total = len(fids)
+            else:
+                log.info(
+                    "SH updater: batch start facilities=%d (dry_run=%s debug=%s conc=%d batch=%d).",
+                    len(fids), settings.SH_UPDATE_DRY_RUN, settings.SH_UPDATE_DEBUG, max_conc,
+                    max(10, settings.SH_UPDATE_BATCH_SIZE),
+                )
+                ok, failed = await _process_fids(fids, flex)
+                dur = int(time.time() - started)
+                log.info("SH updater: done ok=%d failed=%d duration=%ss", ok, failed, dur)
 
         except Exception as e:
             log.warning("SH updater: batch failed early: %s", e)
             app.state.sh_batch_running = False
 
-        # sleep until next cycle
         try:
-            await asyncio.wait_for(stop_evt.wait(), timeout=interval)
+            await asyncio.wait_for(stop_evt.wait(), timeout=sleep_seconds)
         except asyncio.TimeoutError:
             pass
 
@@ -560,6 +611,8 @@ async def lifespan(app: FastAPI):
     app.state.facilities_loaded_at: Optional[float] = None
     app.state.facilities_last_status: str = "MISS"
     app.state.sh_batch_running: bool = False
+    app.state.sh_rotation_offset: int = 0
+    app.state.sh_rotation_total: int = 0
     app.state.parkwhiz_allowlist: List[str] = []
     app.state.parkwhiz_allowlist_loaded_at: Optional[float] = None
     app.state.token_ready = asyncio.Event()
@@ -643,6 +696,11 @@ async def healthz():
         "sh_update": {
             "enabled": settings.SH_UPDATE_ENABLED and (run_update_for_facility_all_rules is not None),
             "interval_seconds": settings.SH_UPDATE_INTERVAL_SECONDS,
+            "rotation_enabled": settings.SH_UPDATE_ROTATION_ENABLED,
+            "chunk_size": settings.SH_UPDATE_CHUNK_SIZE,
+            "chunk_pause_seconds": settings.SH_UPDATE_CHUNK_PAUSE_SECONDS,
+            "rotation_offset": getattr(app.state, "sh_rotation_offset", 0),
+            "rotation_total": getattr(app.state, "sh_rotation_total", 0),
             "only_tiered": settings.SH_UPDATE_ONLY_TIERED,
             "dry_run": settings.SH_UPDATE_DRY_RUN,
             "debug": settings.SH_UPDATE_DEBUG,

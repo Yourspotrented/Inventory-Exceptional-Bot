@@ -914,6 +914,18 @@ def run_update_for_facility_all_rules(
     if not rules:
         raise RuntimeError(f"No inventory rules for facility {facility_id} on {today_local} (tz={tz_name})")
 
+    if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not any(_is_rule_exception(r.raw) for r in rules):
+        client._log(debug, f"[SKIP] facility {facility_id} — no inventory exception rules; events fetch skipped.")
+        return {
+            "facility_id": facility_id,
+            "tz": tz_name,
+            "range_starts": f"{today_local:%m/%d/%Y}T00:00",
+            "rules_found": len(rules),
+            "events_fetched": 0,
+            "skipped": "no_inventory_exception_rules",
+            "processed": [],
+        }
+
     client._log(debug, f"[rules] found {len(rules)}")
     for r in (rules if debug else []):
         client._log(debug, "   - rule", "| qty=", r.quantity, "| valid_from_local=", r.valid_from_local, "| valid_to_local=", r.valid_to_local)

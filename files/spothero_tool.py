@@ -460,6 +460,30 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
     return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
 
 
+def _rule_specificity_key(
+    rule: InventoryRule,
+    ev: EventInfo,
+    overlap_min: int,
+    exact: bool,
+) -> Tuple[int, int, int, int, dt.datetime]:
+    """
+    Sort key for choosing the best IE controller when multiple rules contain an event.
+    Higher values win (most specific rule for the event's date).
+    """
+    ev_start = ev.event_starts_local
+    ev_date = ev_start.date() if ev_start else None
+    r_from = rule.valid_from_local
+    r_to = rule.valid_to_local
+    r_from_date = r_from.date()
+    r_to_date = r_to.date()
+
+    exact_tier = 1 if exact else 0
+    single_day_same = int(ev_date is not None and r_from_date == r_to_date == ev_date)
+    duration_sec = max(0, int((r_to - r_from).total_seconds()))
+
+    return (exact_tier, single_day_same, -duration_sec, overlap_min, r_from)
+
+
 def _is_rule_exception(raw: Dict[str, Any]) -> bool:
     if not isinstance(raw, dict):
         return False
@@ -475,6 +499,11 @@ def _is_rule_exception(raw: Dict[str, Any]) -> bool:
 
 
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
+    """
+    Pick the inventory-exception rule that should control an event.
+    When multiple IE windows contain the event, prefer the most date-specific rule
+    (same-calendar-day IE over multi-day ranges), not the lowest stall count.
+    """
     contenders: List[Tuple[InventoryRule, int, bool]] = []
     for r in rules:
         if not _is_rule_exception(r.raw):
@@ -482,21 +511,20 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
         ok, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
         if not ok:
             continue
-        minutes = _overlap_minutes(r.valid_from_local, r.valid_to_local,
-                                   ev.event_starts_local, ev.event_ends_local)
+        minutes = _overlap_minutes(
+            r.valid_from_local, r.valid_to_local,
+            ev.event_starts_local, ev.event_ends_local,
+        )
         contenders.append((r, minutes, _is_exact_window_match(ev, r)))
 
     if not contenders:
         return None, None
 
-    exacts = [c for c in contenders if c[2] is True]
-    pool = exacts if exacts else contenders
-
-    min_qty = min(c[0].quantity for c in pool)
-    pool = [c for c in pool if c[0].quantity == min_qty]
-
-    pool.sort(key=lambda c: (c[1], c[0].valid_from_local), reverse=True)
-    controller = pool[0][0]
+    contenders.sort(
+        key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2]),
+        reverse=True,
+    )
+    controller = contenders[0][0]
     return controller.quantity, controller
 
 

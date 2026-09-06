@@ -498,12 +498,45 @@ def _is_rule_exception(raw: Dict[str, Any]) -> bool:
     return False
 
 
+def _calendar_day_exception_rules(rules: List[InventoryRule], ev: EventInfo) -> List[InventoryRule]:
+    """Single-calendar-day inventory exceptions on the event's start date."""
+    ev_start = ev.event_starts_local
+    if not ev_start:
+        return []
+    ev_date = ev_start.date()
+    out: List[InventoryRule] = []
+    for r in rules:
+        if not _is_rule_exception(r.raw):
+            continue
+        if r.valid_from_local.date() == r.valid_to_local.date() == ev_date:
+            out.append(r)
+    return out
+
+
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
     """
     Pick the inventory-exception rule that should control an event.
-    When multiple IE windows contain the event, prefer the most date-specific rule
-    (same-calendar-day IE over multi-day ranges), not the lowest stall count.
+
+    Priority:
+    1. Single-calendar-day IE on the event start date (stall count for that date),
+       even when the event extends past the IE end time.
+    2. Among rules that fully contain the event, the most date-specific window.
     """
+    ev_start = ev.event_starts_local
+    if not ev_start:
+        return None, None
+
+    cal_day_rules = _calendar_day_exception_rules(rules, ev)
+    if cal_day_rules:
+        cal_day_rules.sort(
+            key=lambda r: (
+                max(0, int((r.valid_to_local - r.valid_from_local).total_seconds())),
+                r.valid_from_local,
+            ),
+        )
+        controller = cal_day_rules[0]
+        return controller.quantity, controller
+
     contenders: List[Tuple[InventoryRule, int, bool]] = []
     for r in rules:
         if not _is_rule_exception(r.raw):
@@ -1008,22 +1041,16 @@ def run_update_for_facility_all_rules(
         changed_events_count = 0  # track actual changes (POST needed)
 
         for ev in all_events:
-            ok, why = _event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)
-            if not ok:
+            target_qty, controller = _containing_controller(rules, ev)
+            if controller is None:
                 if debug and len(non_contain_debug) < 10:
-                    non_contain_debug.append(f"event {ev.event_id}: {why}")
+                    non_contain_debug.append(f"event {ev.event_id}: no controller rule")
+                continue
+            if controller is not rule:
                 continue
 
             if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not rule_is_exception:
                 client._log(debug, f"[SKIP] event_id={ev.event_id} — rule is not an exception.")
-                continue
-
-            target_qty, controller = _containing_controller(rules, ev)
-            if controller is None:
-                client._log(debug, f"[SKIP] event_id={ev.event_id} — no containing exception found.")
-                continue
-            if controller is not rule:
-                client._log(debug, f"[SKIP] event_id={ev.event_id} — another rule controls (qty={target_qty}).")
                 continue
 
             considered_count += 1

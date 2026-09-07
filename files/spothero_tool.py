@@ -513,13 +513,52 @@ def _calendar_day_exception_rules(rules: List[InventoryRule], ev: EventInfo) -> 
     return out
 
 
+def _same_day_overlap_key(rule: InventoryRule, ev: EventInfo) -> Tuple[int, int, int, dt.datetime]:
+    """Higher = better match among same-calendar-day IE rules for this event."""
+    overlap_min = _overlap_minutes(
+        rule.valid_from_local, rule.valid_to_local,
+        ev.event_starts_local, ev.event_ends_local,
+    )
+    contained = int(_event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)[0])
+    duration_sec = max(0, int((rule.valid_to_local - rule.valid_from_local).total_seconds()))
+    return (contained, overlap_min, -duration_sec, rule.valid_from_local)
+
+
+def _pick_calendar_day_controller(
+    cal_day_rules: List[InventoryRule],
+    ev: EventInfo,
+) -> Optional[InventoryRule]:
+    """
+    Choose a same-calendar-day IE for an event.
+
+    - One same-day IE on that date: use it for any event starting that day
+      (event may extend past the IE end — e.g. evening events on a daytime IE).
+    - Multiple same-day IEs: only rules that overlap the event time are candidates;
+      pick contained > most overlap > narrowest window.
+    """
+    if not cal_day_rules:
+        return None
+
+    if len(cal_day_rules) == 1:
+        return cal_day_rules[0]
+
+    overlapping = [
+        r for r in cal_day_rules
+        if _event_within_local(ev, r.valid_from_local, r.valid_to_local)[0]
+    ]
+    if not overlapping:
+        return None
+
+    overlapping.sort(key=lambda r: _same_day_overlap_key(r, ev), reverse=True)
+    return overlapping[0]
+
+
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
     """
     Pick the inventory-exception rule that should control an event.
 
     Priority:
-    1. Single-calendar-day IE on the event start date (stall count for that date),
-       even when the event extends past the IE end time.
+    1. Same-calendar-day IE matched to the event time (see _pick_calendar_day_controller).
     2. Among rules that fully contain the event, the most date-specific window.
     """
     ev_start = ev.event_starts_local
@@ -527,15 +566,9 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
         return None, None
 
     cal_day_rules = _calendar_day_exception_rules(rules, ev)
-    if cal_day_rules:
-        cal_day_rules.sort(
-            key=lambda r: (
-                max(0, int((r.valid_to_local - r.valid_from_local).total_seconds())),
-                r.valid_from_local,
-            ),
-        )
-        controller = cal_day_rules[0]
-        return controller.quantity, controller
+    cal_controller = _pick_calendar_day_controller(cal_day_rules, ev)
+    if cal_controller is not None:
+        return cal_controller.quantity, cal_controller
 
     contenders: List[Tuple[InventoryRule, int, bool]] = []
     for r in rules:

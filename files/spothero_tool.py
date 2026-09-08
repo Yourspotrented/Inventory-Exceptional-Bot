@@ -477,14 +477,38 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
     return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
 
 
+def _event_start_in_rule_window(
+    ev: EventInfo,
+    win_from_local: dt.datetime,
+    win_to_local: dt.datetime,
+) -> bool:
+    """True when the event start time falls inside the IE window (inclusive)."""
+    s = ev.event_starts_local
+    if not s:
+        return False
+    return win_from_local <= s <= win_to_local
+
+
+def _any_exception_ie_covers_event_start(rules: List[InventoryRule], ev: EventInfo) -> bool:
+    """True if any inventory-exception rule window includes the event start time."""
+    for r in rules:
+        if not _is_rule_exception(r.raw):
+            continue
+        if _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local):
+            return True
+    return False
+
+
 def _rule_specificity_key(
     rule: InventoryRule,
     ev: EventInfo,
     overlap_min: int,
     exact: bool,
-) -> Tuple[int, int, int, int, dt.datetime]:
+    *,
+    contained: bool = False,
+) -> Tuple[int, int, int, int, int, dt.datetime]:
     """
-    Sort key for choosing the best IE controller when multiple rules contain an event.
+    Sort key for choosing the best IE controller when multiple rules match an event.
     Higher values win (most specific rule for the event's date).
     """
     ev_start = ev.event_starts_local
@@ -495,10 +519,11 @@ def _rule_specificity_key(
     r_to_date = r_to.date()
 
     exact_tier = 1 if exact else 0
+    contained_tier = 1 if contained else 0
     single_day_same = int(ev_date is not None and r_from_date == r_to_date == ev_date)
     duration_sec = max(0, int((r_to - r_from).total_seconds()))
 
-    return (exact_tier, single_day_same, -duration_sec, overlap_min, r_from)
+    return (exact_tier, contained_tier, single_day_same, -duration_sec, overlap_min, r_from)
 
 
 def _is_rule_exception(raw: Dict[str, Any]) -> bool:
@@ -576,7 +601,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
 
     Priority:
     1. Same-calendar-day IE matched to the event time (see _pick_calendar_day_controller).
-    2. Among rules that fully contain the event, the most date-specific window.
+    2. Multi-day IE where event start falls inside the rule window (even if event ends later).
+    3. Among matches, prefer full containment, then most specific/narrowest window.
     """
     ev_start = ev.event_starts_local
     if not ev_start:
@@ -587,24 +613,25 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     if cal_controller is not None:
         return cal_controller.quantity, cal_controller
 
-    contenders: List[Tuple[InventoryRule, int, bool]] = []
+    contenders: List[Tuple[InventoryRule, int, bool, bool]] = []
     for r in rules:
         if not _is_rule_exception(r.raw):
             continue
-        ok, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
-        if not ok:
+        contained, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
+        start_in = _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local)
+        if not contained and not start_in:
             continue
         minutes = _overlap_minutes(
             r.valid_from_local, r.valid_to_local,
             ev.event_starts_local, ev.event_ends_local,
         )
-        contenders.append((r, minutes, _is_exact_window_match(ev, r)))
+        contenders.append((r, minutes, _is_exact_window_match(ev, r), contained))
 
     if not contenders:
         return None, None
 
     contenders.sort(
-        key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2]),
+        key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
         reverse=True,
     )
     controller = contenders[0][0]
@@ -1408,6 +1435,12 @@ def run_update_for_facility_all_rules(
         for ev in all_events:
             _, controller = _containing_controller(rules, ev)
             if controller is not None:
+                continue
+            if _any_exception_ie_covers_event_start(rules, ev):
+                client._log(
+                    debug,
+                    f"[baseline][SKIP] event_id={ev.event_id} — IE covers event start; not using baseline",
+                )
                 continue
 
             target_qty = int(baseline_qty)

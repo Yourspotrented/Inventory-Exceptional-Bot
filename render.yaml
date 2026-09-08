@@ -57,6 +57,8 @@ services:
         value: "50"
       - key: SH_UPDATE_CHUNK_PAUSE_SECONDS
         value: "600"
+      - key: APPLY_BASELINE_INVENTORY_WHEN_NO_IE
+        value: "true"
       - key: LOG_LEVEL
         value: "INFO"
 

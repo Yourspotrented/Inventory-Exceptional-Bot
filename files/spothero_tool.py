@@ -29,6 +29,10 @@ TEAMS_PER_EVENT_NOTIFICATIONS = (os.getenv("TEAMS_PER_EVENT_NOTIFICATIONS", "fal
 TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE = (
     os.getenv("TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE", "true").lower() in {"1", "true", "yes"}
 )
+# When no IE controls an event, apply operator transient total_inventory (operator-inventory API).
+APPLY_BASELINE_INVENTORY_WHEN_NO_IE = (
+    os.getenv("APPLY_BASELINE_INVENTORY_WHEN_NO_IE", "true").lower() in {"1", "true", "yes"}
+)
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -177,6 +181,19 @@ class SpotHeroClient:
                 )
             )
         return rules
+
+    def get_operator_baseline_inventory(self, facility_id: int) -> Optional[int]:
+        """Transient total inventory from operator panel (used when no IE applies)."""
+        try:
+            url = f"{self.base_url}/facilities/{facility_id}/operator-inventory/"
+            payload = self._send("GET", url, expect_status=(200, 204)).json()
+            transient = (payload.get("data") or {}).get("transient") or {}
+            raw = transient.get("total_inventory")
+            if raw is None:
+                return None
+            return int(raw)
+        except Exception:
+            return None
 
     # --- API: upcoming-events (GET, paginated) ---
     def get_upcoming_events_page(
@@ -988,6 +1005,129 @@ def _build_rule_events_card(
         ],
     }
 
+
+def _build_baseline_events_card(
+    *,
+    facility_id: int,
+    facility_name: str,
+    facility_title: str,
+    tz_name: str,
+    baseline_qty: int,
+    events: List[Dict[str, Any]],
+    changed_events_count: int,
+) -> Dict[str, Any]:
+    """Teams summary when no IE applies — use operator transient total inventory."""
+    events_sorted = sorted(events, key=lambda e: (e.get("start") or ""))
+    MAX_ROWS = 50
+    shown = events_sorted[:MAX_ROWS]
+    hidden_count = max(0, len(events_sorted) - len(shown))
+
+    def _num_cell(v: Any) -> Dict[str, Any]:
+        return {"type": "TextBlock", "text": str(v), "horizontalAlignment": "Right"}
+
+    def row(idx: int, e: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "columns": [
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": str(idx), "isSubtle": True}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": f"#{e['id']}"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": e.get("start_fmt", "—"), "wrap": True}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": e.get("end_fmt", "—"), "wrap": True}]},
+                {"type": "Column", "width": "auto",
+                 "items": [_num_cell(e.get("old_inv", "—"))]},
+                {"type": "Column", "width": "auto",
+                 "items": [_num_cell(e.get("new_inv", "—"))]},
+            ],
+        }
+
+    body_rows: List[Dict[str, Any]] = [
+        {"type": "TextBlock", "text": "Upcoming Events (No IE)", "weight": "Bolder", "size": "Medium"},
+        {
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "separator": True,
+            "columns": [
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "#", "weight": "Bolder"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "Event ID", "weight": "Bolder"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Event Start", "weight": "Bolder"}]},
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Event End", "weight": "Bolder"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "Old Inventory", "weight": "Bolder", "horizontalAlignment": "Right"}]},
+                {"type": "Column", "width": "auto",
+                 "items": [{"type": "TextBlock", "text": "New Inventory", "weight": "Bolder", "horizontalAlignment": "Right"}]},
+            ],
+        },
+    ]
+    for i, e in enumerate(shown, start=1):
+        body_rows.append(row(i, e))
+    if hidden_count:
+        body_rows.append({"type": "TextBlock", "text": f"+{hidden_count} more not shown", "isSubtle": True})
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.5",
+        "msteams": {"width": "Full"},
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": [
+                    {"type": "TextBlock", "text": "Inventory Update — Baseline (No IE)", "weight": "Bolder", "size": "Large"},
+                    {"type": "TextBlock", "text": "SpotHero Inventory Bot", "isSubtle": True, "spacing": "None"},
+                ],
+            },
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": (
+                            "No inventory exception applies to these upcoming events. "
+                            "Using the operator transient total inventory count."
+                        ),
+                        "wrap": True,
+                    },
+                    {
+                        "type": "FactSet",
+                        "facts": [
+                            {"title": "Facility", "value": facility_title or facility_name or str(facility_id)},
+                            {"title": "Facility ID", "value": str(facility_id)},
+                            {"title": "Transient Total Inventory", "value": str(baseline_qty)},
+                            {"title": "Events Count", "value": str(len(events))},
+                            {"title": "Events Needing Change", "value": str(changed_events_count)},
+                        ],
+                    },
+                ],
+            },
+            {"type": "Container", "spacing": "Medium", "items": body_rows},
+            {
+                "type": "Container",
+                "spacing": "Medium",
+                "items": [
+                    {"type": "TextBlock",
+                     "text": f"Posted by Flow bot • Values are local to {tz_name}",
+                     "isSubtle": True, "size": "Small"},
+                ],
+            },
+        ],
+        "actions": [
+            {"type": "Action.OpenUrl", "title": "Open SpotHero", "url": "https://spothero.com/operator"},
+        ],
+    }
+
+
 # ---------- Orchestrator ----------
 def run_update_for_facility_all_rules(
     auth_token: str,
@@ -1009,16 +1149,23 @@ def run_update_for_facility_all_rules(
         raise RuntimeError(f"No inventory rules for facility {facility_id} on {today_local} (tz={tz_name})")
 
     if ENFORCE_ONLY_IF_INVENTORY_EXCEPTION and not any(_is_rule_exception(r.raw) for r in rules):
-        client._log(debug, f"[SKIP] facility {facility_id} — no inventory exception rules; events fetch skipped.")
-        return {
-            "facility_id": facility_id,
-            "tz": tz_name,
-            "range_starts": f"{today_local:%m/%d/%Y}T00:00",
-            "rules_found": len(rules),
-            "events_fetched": 0,
-            "skipped": "no_inventory_exception_rules",
-            "processed": [],
-        }
+        if not APPLY_BASELINE_INVENTORY_WHEN_NO_IE:
+            client._log(debug, f"[SKIP] facility {facility_id} — no inventory exception rules; events fetch skipped.")
+            return {
+                "facility_id": facility_id,
+                "tz": tz_name,
+                "range_starts": f"{today_local:%m/%d/%Y}T00:00",
+                "rules_found": len(rules),
+                "events_fetched": 0,
+                "skipped": "no_inventory_exception_rules",
+                "processed": [],
+            }
+        client._log(debug, f"[INFO] facility {facility_id} — no IE rules; baseline inventory pass enabled.")
+
+    baseline_qty: Optional[int] = None
+    if APPLY_BASELINE_INVENTORY_WHEN_NO_IE:
+        baseline_qty = client.get_operator_baseline_inventory(facility_id)
+        client._log(debug, f"[baseline] operator transient total_inventory={baseline_qty}")
 
     client._log(debug, f"[rules] found {len(rules)}")
     for r in (rules if debug else []):
@@ -1251,6 +1398,137 @@ def run_update_for_facility_all_rules(
                 "events_in_window": len(events_for_rule),
             },
             "events_updated_or_skipped": matched,
+        })
+
+    # Baseline transient inventory for upcoming events with no controlling IE.
+    baseline_events: List[Dict[str, Any]] = []
+    baseline_matched: List[Dict[str, Any]] = []
+    baseline_changed_count = 0
+    if APPLY_BASELINE_INVENTORY_WHEN_NO_IE and baseline_qty is not None:
+        for ev in all_events:
+            _, controller = _containing_controller(rules, ev)
+            if controller is not None:
+                continue
+
+            target_qty = int(baseline_qty)
+            current_total = sum(int(t.get("inventory", 0)) for t in ev.tiers)
+            baseline_events.append({
+                "id": ev.event_id,
+                "start": ev.event_starts_local.isoformat() if ev.event_starts_local else None,
+                "end": ev.event_ends_local.isoformat() if ev.event_ends_local else None,
+                "start_fmt": _fmt_local(ev.event_starts_local),
+                "end_fmt": _fmt_local(ev.event_ends_local),
+                "old_inv": int(current_total),
+                "new_inv": int(target_qty),
+            })
+
+            if current_total == target_qty:
+                before_pairs = _tiers_pairs(ev.tiers)
+                desired = ev.tiers
+                desired_pairs = before_pairs
+                identical = True
+                if debug:
+                    client._log(debug, f"[baseline][SKIP] event_id={ev.event_id} — already at {target_qty}")
+            else:
+                current_tier_number = None
+                try:
+                    current_tier_number = int((ev.raw.get("current_tier") or {}).get("current_tier_number"))
+                except Exception:
+                    current_tier_number = None
+                desired = _alloc_inventory_smart(ev.tiers, target_qty, current_tier_number)
+                before_pairs = _tiers_pairs(ev.tiers)
+                desired_pairs = _tiers_pairs(desired)
+                identical = (before_pairs == desired_pairs)
+
+            post_result: Optional[Dict[str, Any]] = None
+            verify_after: Optional[List[Tuple[int, int, int]]] = None
+            applied: Optional[bool] = None
+
+            if not identical:
+                baseline_changed_count += 1
+                client._log(debug, f"[baseline][POST] event_id={ev.event_id} qty={target_qty}")
+                try:
+                    post_result = client.post_tiered_event_rating_rules(
+                        facility_id=facility_id,
+                        event_ids=[ev.event_id],
+                        tiers=desired,
+                        event_starts_offset=ev.starts_offset,
+                        event_ends_offset=ev.ends_offset,
+                        rule_id=ev.rule_id,
+                        stop_selling_before_duration=None,
+                        dry_run=dry_run,
+                    )
+                except Exception:
+                    raise
+
+                if not dry_run:
+                    ev_day = ev.event_starts_local.date() if ev.event_starts_local else today_local
+                    chk = client.get_event_on_day(
+                        facility_id=facility_id,
+                        day=ev_day,
+                        target_event_id=ev.event_id,
+                        per_page=25,
+                        max_pages=10,
+                        debug=debug,
+                    )
+                    if chk:
+                        verify_after = _tiers_pairs(chk.tiers)
+                        applied = (verify_after == desired_pairs)
+
+            baseline_matched.append({
+                "event_id": ev.event_id,
+                "baseline_qty": target_qty,
+                "tiers_before": before_pairs,
+                "tiers_desired": desired_pairs,
+                "skipped_no_change": identical,
+                "applied": applied,
+            })
+
+        if (
+            TEAMS_RULE_SUMMARY_ENABLED
+            and TEAMS_WEBHOOK_URL
+            and baseline_events
+            and (not dry_run or TEAMS_NOTIFY_DRY_RUN)
+        ):
+            should_send = (baseline_changed_count > 0) or (not TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE)
+            if should_send:
+                try:
+                    _post_teams_card(_build_baseline_events_card(
+                        facility_id=facility_id,
+                        facility_name=facility_name,
+                        facility_title=facility_title,
+                        tz_name=tz_name,
+                        baseline_qty=int(baseline_qty),
+                        events=baseline_events,
+                        changed_events_count=baseline_changed_count,
+                    ))
+                    client._log(
+                        debug,
+                        f"[TEAMS] sent baseline summary: events={len(baseline_events)} "
+                        f"| changed_events={baseline_changed_count}",
+                    )
+                except Exception as e:
+                    client._log(debug, f"[TEAMS] failed to send baseline summary: {e!r}")
+
+        if baseline_events:
+            client._log(
+                debug,
+                f"[baseline] no_ie_events={len(baseline_events)} changed={baseline_changed_count} qty={baseline_qty}",
+            )
+
+    summary["baseline_inventory"] = {
+        "enabled": APPLY_BASELINE_INVENTORY_WHEN_NO_IE,
+        "transient_total": baseline_qty,
+        "events_without_ie": len(baseline_events),
+        "events_changed": baseline_changed_count,
+    }
+    if baseline_matched:
+        summary["processed"].append({
+            "rule": {
+                "type": "baseline_no_ie",
+                "transient_total_inventory": baseline_qty,
+            },
+            "events_updated_or_skipped": baseline_matched,
         })
 
     return summary

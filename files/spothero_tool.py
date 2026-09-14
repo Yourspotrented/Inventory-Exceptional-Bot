@@ -33,6 +33,9 @@ TEAMS_RULE_SUMMARY_ONLY_ON_CHANGE = (
 APPLY_BASELINE_INVENTORY_WHEN_NO_IE = (
     os.getenv("APPLY_BASELINE_INVENTORY_WHEN_NO_IE", "true").lower() in {"1", "true", "yes"}
 )
+# Soft IE window: event may start a bit before valid_from or end a bit after valid_to.
+IE_START_GRACE_HOURS = max(0.0, float(os.getenv("IE_START_GRACE_HOURS", "2")))
+IE_END_GRACE_HOURS = max(0.0, float(os.getenv("IE_END_GRACE_HOURS", "1")))
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -158,8 +161,6 @@ class SpotHeroClient:
             if item.get("status") != "enabled":
                 continue
             if item.get("is_expired"):
-                continue
-            if _is_cancelled_rule(item):
                 continue
 
             vf_raw = item.get("valid_from")
@@ -479,6 +480,18 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
     return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
 
 
+def _effective_ie_window(rule: InventoryRule) -> Tuple[dt.datetime, dt.datetime]:
+    """IE window plus start/end grace (default −2h / +1h)."""
+    start_grace = dt.timedelta(hours=IE_START_GRACE_HOURS)
+    end_grace = dt.timedelta(hours=IE_END_GRACE_HOURS)
+    return rule.valid_from_local - start_grace, rule.valid_to_local + end_grace
+
+
+def _event_overlaps_effective_ie(ev: EventInfo, rule: InventoryRule) -> bool:
+    ef, et = _effective_ie_window(rule)
+    return _event_within_local(ev, ef, et)[0]
+
+
 def _event_start_in_rule_window(
     ev: EventInfo,
     win_from_local: dt.datetime,
@@ -492,11 +505,11 @@ def _event_start_in_rule_window(
 
 
 def _any_exception_ie_covers_event_start(rules: List[InventoryRule], ev: EventInfo) -> bool:
-    """True if any inventory-exception rule window includes the event start time."""
+    """True if any IE (with grace) overlaps the event — do not apply baseline."""
     for r in rules:
         if not _is_rule_exception(r.raw):
             continue
-        if _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local):
+        if _event_overlaps_effective_ie(ev, r):
             return True
     return False
 
@@ -511,7 +524,7 @@ def _rule_specificity_key(
 ) -> Tuple[int, int, int, int, int, dt.datetime]:
     """
     Sort key for choosing the best IE controller when multiple rules match an event.
-    Higher values win (most specific rule for the event's date).
+    Higher values win (most specific rule for the event's date/time).
     """
     ev_start = ev.event_starts_local
     ev_date = ev_start.date() if ev_start else None
@@ -525,24 +538,11 @@ def _rule_specificity_key(
     single_day_same = int(ev_date is not None and r_from_date == r_to_date == ev_date)
     duration_sec = max(0, int((r_to - r_from).total_seconds()))
 
-    return (exact_tier, contained_tier, single_day_same, -duration_sec, overlap_min, r_from)
-
-
-def _is_cancelled_rule(raw: Dict[str, Any]) -> bool:
-    """Treat title/description 'cancelled' as inactive even if API status is enabled."""
-    if not isinstance(raw, dict):
-        return False
-    blob = " ".join(
-        str(raw.get(k) or "")
-        for k in ("title", "description", "name", "label")
-    ).lower()
-    return "cancel" in blob
+    return (exact_tier, single_day_same, contained_tier, overlap_min, -duration_sec, r_from)
 
 
 def _is_rule_exception(raw: Dict[str, Any]) -> bool:
     if not isinstance(raw, dict):
-        return False
-    if _is_cancelled_rule(raw):
         return False
     if raw.get("is_exception") is True:
         return True
@@ -555,133 +555,37 @@ def _is_rule_exception(raw: Dict[str, Any]) -> bool:
     return False
 
 
-def _calendar_day_exception_rules(rules: List[InventoryRule], ev: EventInfo) -> List[InventoryRule]:
-    """Single-calendar-day inventory exceptions on the event's start date."""
-    ev_start = ev.event_starts_local
-    if not ev_start:
-        return []
-    ev_date = ev_start.date()
-    out: List[InventoryRule] = []
-    for r in rules:
-        if not _is_rule_exception(r.raw):
-            continue
-        if r.valid_from_local.date() == r.valid_to_local.date() == ev_date:
-            out.append(r)
-    return out
-
-
-def _same_day_overlap_key(rule: InventoryRule, ev: EventInfo) -> Tuple[int, int, int, dt.datetime]:
-    """Higher = better match among same-calendar-day IE rules for this event."""
-    overlap_min = _overlap_minutes(
-        rule.valid_from_local, rule.valid_to_local,
-        ev.event_starts_local, ev.event_ends_local,
-    )
-    contained = int(_event_contained_in(ev, rule.valid_from_local, rule.valid_to_local)[0])
-    duration_sec = max(0, int((rule.valid_to_local - rule.valid_from_local).total_seconds()))
-    return (contained, overlap_min, -duration_sec, rule.valid_from_local)
-
-
-def _pick_calendar_day_controller(
-    cal_day_rules: List[InventoryRule],
-    ev: EventInfo,
-) -> Optional[InventoryRule]:
-    """
-    Choose a same-calendar-day IE only when it overlaps the event time.
-    A 3–5 PM IE must not control a 7–10 PM event (baseline applies instead).
-    Events that start inside the window and run a bit past IE end still overlap.
-    """
-    if not cal_day_rules:
-        return None
-
-    overlapping = [
-        r for r in cal_day_rules
-        if _event_within_local(ev, r.valid_from_local, r.valid_to_local)[0]
-    ]
-    if not overlapping:
-        return None
-
-    overlapping.sort(key=lambda r: _same_day_overlap_key(r, ev), reverse=True)
-    return overlapping[0]
-
-
-def _pick_multiday_date_cover(
-    rules: List[InventoryRule],
-    ev: EventInfo,
-) -> Optional[InventoryRule]:
-    """
-    Multi-day IE whose calendar range includes the event start date.
-    Used when the event starts after IE valid_to time on the end date
-    (e.g. IE Sep 15 7AM–Sep 16 7AM, event Sep 16 5PM → still 1 stall).
-    """
-    ev_start = ev.event_starts_local
-    if not ev_start:
-        return None
-    ev_date = ev_start.date()
-    covers: List[InventoryRule] = []
-    for r in rules:
-        if not _is_rule_exception(r.raw):
-            continue
-        r_from_d = r.valid_from_local.date()
-        r_to_d = r.valid_to_local.date()
-        if r_from_d == r_to_d:
-            continue
-        if r_from_d <= ev_date <= r_to_d:
-            covers.append(r)
-    if not covers:
-        return None
-    covers.sort(
-        key=lambda r: (
-            max(0, int((r.valid_to_local - r.valid_from_local).total_seconds())),
-            r.valid_from_local,
-        )
-    )
-    return covers[0]
-
-
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
     """
-    Pick the inventory-exception rule that should control an event.
+    Pick the inventory-exception that should control an event.
 
-    Priority:
-    1. Same-calendar-day IE matched to the event time (see _pick_calendar_day_controller).
-    2. Multi-day IE where event start falls inside the rule window (even if event ends later).
-    3. Among matches, prefer full containment, then most specific/narrowest window.
+    Titles like 'cancelled' are still valid IEs. Match if the event overlaps
+    the IE window expanded by IE_START_GRACE_HOURS / IE_END_GRACE_HOURS.
+    Among matches, prefer same-day, contained, most overlap, then narrowest.
     """
-    ev_start = ev.event_starts_local
-    if not ev_start:
+    if not ev.event_starts_local or not ev.event_ends_local:
         return None, None
-
-    cal_day_rules = _calendar_day_exception_rules(rules, ev)
-    cal_controller = _pick_calendar_day_controller(cal_day_rules, ev)
-    if cal_controller is not None:
-        return cal_controller.quantity, cal_controller
 
     contenders: List[Tuple[InventoryRule, int, bool, bool]] = []
     for r in rules:
         if not _is_rule_exception(r.raw):
             continue
-        contained, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
-        start_in = _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local)
-        if not contained and not start_in:
+        if not _event_overlaps_effective_ie(ev, r):
             continue
-        minutes = _overlap_minutes(
-            r.valid_from_local, r.valid_to_local,
-            ev.event_starts_local, ev.event_ends_local,
-        )
+        ef, et = _effective_ie_window(r)
+        minutes = _overlap_minutes(ef, et, ev.event_starts_local, ev.event_ends_local)
+        contained, _ = _event_contained_in(ev, r.valid_from_local, r.valid_to_local)
         contenders.append((r, minutes, _is_exact_window_match(ev, r), contained))
 
-    if contenders:
-        contenders.sort(
-            key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
-            reverse=True,
-        )
-        controller = contenders[0][0]
-        return controller.quantity, controller
+    if not contenders:
+        return None, None
 
-    date_cover = _pick_multiday_date_cover(rules, ev)
-    if date_cover is not None:
-        return date_cover.quantity, date_cover
-    return None, None
+    contenders.sort(
+        key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
+        reverse=True,
+    )
+    controller = contenders[0][0]
+    return controller.quantity, controller
 
 
 # ---------- Teams notifier (Adaptive Card) ----------

@@ -59,6 +59,10 @@ services:
         value: "600"
       - key: APPLY_BASELINE_INVENTORY_WHEN_NO_IE
         value: "true"
+      - key: IE_START_GRACE_HOURS
+        value: "2"
+      - key: IE_END_GRACE_HOURS
+        value: "1"
       - key: LOG_LEVEL
         value: "INFO"
 

@@ -39,7 +39,7 @@ PARKWHIZ_MATCH_TOLERANCE_MINUTES = int(os.getenv("PARKWHIZ_MATCH_TOLERANCE_MINUT
 PARKWHIZ_MATCH_SAME_DAY_MINUTES = int(os.getenv("PARKWHIZ_MATCH_SAME_DAY_MINUTES", "180"))
 PARKWHIZ_STATE_FILE = os.getenv("PARKWHIZ_STATE_FILE", os.path.join("files", "parkwhiz_processed.json"))
 PARKWHIZ_DRY_RUN = os.getenv("PARKWHIZ_DRY_RUN", "false").lower() in {"1", "true", "yes"}
-PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "3")))
+PARKWHIZ_MAX_WORKERS = max(1, int(os.getenv("PARKWHIZ_MAX_WORKERS", "1")))
 # powerautomate = {"card": ...} for triggerBody()?['card'] in Power Automate / Workflows
 # incoming = standard Teams incoming webhook attachments format
 PARKWHIZ_TEAMS_WEBHOOK_MODE = (os.getenv("PARKWHIZ_TEAMS_WEBHOOK_MODE") or "powerautomate").strip().lower()
@@ -973,7 +973,11 @@ def run_parkwhiz_poll(
     processed_done = set(str(x) for x in (state.get("processed_ids") or []))
     results: List[ProcessResult] = []
 
-    message_ids = gmail.list_message_ids(query, max_results=max_messages)
+    try:
+        message_ids = gmail.list_message_ids(query, max_results=max_messages)
+    except Exception as e:
+        log.warning("ParkWhiz Gmail list failed (will retry next poll): %s", e)
+        return results
     pending = [mid for mid in message_ids if not _should_skip_message(state, mid)]
     log.info(
         "ParkWhiz Gmail poll: query=%r candidates=%d pending=%d done=%d workers=%d allowlist=%s",
@@ -993,14 +997,20 @@ def run_parkwhiz_poll(
     if not pending:
         return results
 
-    if len(pending) == 1:
-        pending_results = [_process_one(
-            gmail=gmail, message_id=pending[0], auth_token=auth_token,
-            facilities=facilities, allowlist=allowlist, tz_name=tz_name, dry_run=dry_run, debug=debug,
-        )]
+    pending_results: List[ProcessResult] = []
+    workers = min(PARKWHIZ_MAX_WORKERS, len(pending))
+    if workers <= 1:
+        for mid in pending:
+            try:
+                pending_results.append(_process_one(
+                    gmail=gmail, message_id=mid, auth_token=auth_token,
+                    facilities=facilities, allowlist=allowlist, tz_name=tz_name,
+                    dry_run=dry_run, debug=debug,
+                ))
+            except Exception as e:
+                log.warning("ParkWhiz process failed for %s (will retry next poll): %s", mid, e)
     else:
-        pending_results = []
-        with ThreadPoolExecutor(max_workers=min(PARKWHIZ_MAX_WORKERS, len(pending))) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {
                 pool.submit(
                     _process_one,
@@ -1016,11 +1026,11 @@ def run_parkwhiz_poll(
                 for mid in pending
             }
             for fut in as_completed(futs):
+                mid = futs[fut]
                 try:
                     pending_results.append(fut.result())
                 except Exception as e:
-                    mid = futs[fut]
-                    log.exception("ParkWhiz parallel process failed for %s: %s", mid, e)
+                    log.warning("ParkWhiz process failed for %s (will retry next poll): %s", mid, e)
 
     for result in pending_results:
         _finalize_result(gmail=gmail, result=result, tz_name=tz_name, state=state)

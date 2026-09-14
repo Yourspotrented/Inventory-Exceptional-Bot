@@ -93,6 +93,10 @@ services:
         # MUST stay false for Power Automate — true shows raw JSON text in Teams
       - key: PARKWHIZ_MAX_WORKERS
         value: "1"
+      - key: GMAIL_HTTP_TIMEOUT_SEC
+        value: "90"
+      - key: GMAIL_RETRY_ATTEMPTS
+        value: "3"
       - key: PARKWHIZ_TEAMS_WEBHOOK_URL
         sync: false
       - key: PARKWHIZ_ALLOWLIST_ENABLED

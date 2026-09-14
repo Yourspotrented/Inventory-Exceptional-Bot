@@ -6,15 +6,25 @@ import base64
 import logging
 import os
 import re
+import socket
+import threading
+import time
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+import httplib2
 from google.auth.transport.requests import Request as GRequest
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 log = logging.getLogger("app.gmail")
+
+T = TypeVar("T")
+
+GMAIL_HTTP_TIMEOUT_SEC = max(30, int(os.getenv("GMAIL_HTTP_TIMEOUT_SEC", "90")))
+GMAIL_RETRY_ATTEMPTS = max(1, int(os.getenv("GMAIL_RETRY_ATTEMPTS", "3")))
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
@@ -69,6 +79,7 @@ class GmailClient:
         else:
             self.user_id = raw_delegate
         self._svc = None
+        self._lock = threading.Lock()
 
     def _service(self):
         if self._svc is not None:
@@ -83,49 +94,91 @@ class GmailClient:
         )
         if not creds.valid:
             creds.refresh(GRequest())
-        self._svc = build("gmail", "v1", credentials=creds, cache_discovery=False)
-        log.info("Gmail service ready userId=%s scopes=%s", self.user_id, _gmail_scopes())
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=GMAIL_HTTP_TIMEOUT_SEC))
+        self._svc = build("gmail", "v1", http=http, cache_discovery=False)
+        log.info(
+            "Gmail service ready userId=%s scopes=%s timeout=%ss",
+            self.user_id, _gmail_scopes(), GMAIL_HTTP_TIMEOUT_SEC,
+        )
         return self._svc
+
+    def _reset_service(self) -> None:
+        self._svc = None
+
+    def _with_retry(self, op_name: str, fn: Callable[[], T]) -> T:
+        last: Optional[BaseException] = None
+        for attempt in range(1, GMAIL_RETRY_ATTEMPTS + 1):
+            try:
+                with self._lock:
+                    return fn()
+            except (TimeoutError, socket.timeout, OSError, HttpError, httplib2.HttpLib2Error) as e:
+                last = e
+                retryable = True
+                if isinstance(e, HttpError):
+                    retryable = int(getattr(e.resp, "status", 0) or 0) in {429, 500, 502, 503, 504}
+                if not retryable or attempt >= GMAIL_RETRY_ATTEMPTS:
+                    raise
+                log.warning(
+                    "Gmail %s timed out/failed (attempt %d/%d): %s",
+                    op_name, attempt, GMAIL_RETRY_ATTEMPTS, e,
+                )
+                with self._lock:
+                    self._reset_service()
+                time.sleep(min(8.0, 1.5 * attempt))
+        assert last is not None
+        raise last
 
     def list_message_ids(self, query: str, *, max_results: int = 20) -> List[str]:
         """List message IDs using Gmail search query (requires gmail.readonly scope)."""
-        svc = self._service()
         q = (query or "").strip()
         if q and "is:" not in q:
             q = f"{q} is:unread"
         max_results = max(1, min(max_results, 100))
         log.info("Gmail list via q=%r userId=%s", q, self.user_id)
 
-        ids: List[str] = []
-        page: Optional[str] = None
-        while len(ids) < max_results:
-            batch = min(100, max_results - len(ids))
-            resp = (
-                svc.users()
-                .messages()
-                .list(userId=self.user_id, q=q, pageToken=page, maxResults=batch)
-                .execute()
-            )
-            ids.extend(str(m["id"]) for m in (resp.get("messages") or []) if m.get("id"))
-            page = resp.get("nextPageToken")
-            if not page:
-                break
-        return ids[:max_results]
+        def _list() -> List[str]:
+            svc = self._service()
+            ids: List[str] = []
+            page: Optional[str] = None
+            while len(ids) < max_results:
+                batch = min(100, max_results - len(ids))
+                resp = (
+                    svc.users()
+                    .messages()
+                    .list(userId=self.user_id, q=q, pageToken=page, maxResults=batch)
+                    .execute()
+                )
+                ids.extend(str(m["id"]) for m in (resp.get("messages") or []) if m.get("id"))
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+            return ids[:max_results]
+
+        return self._with_retry("list", _list)
 
     def get_message(self, message_id: str) -> Dict[str, Any]:
-        svc = self._service()
-        return svc.users().messages().get(userId=self.user_id, id=message_id, format="full").execute()
+        def _get() -> Dict[str, Any]:
+            svc = self._service()
+            return svc.users().messages().get(
+                userId=self.user_id, id=message_id, format="full",
+            ).execute()
+
+        return self._with_retry(f"get {message_id}", _get)
 
     def mark_as_read(self, message_id: str) -> None:
         if GMAIL_MODIFY_SCOPE not in _gmail_scopes():
             log.debug("Gmail mark_as_read skipped (readonly scope only)")
             return
-        svc = self._service()
-        svc.users().messages().modify(
-            userId=self.user_id,
-            id=message_id,
-            body={"removeLabelIds": ["UNREAD"]},
-        ).execute()
+
+        def _mark() -> None:
+            svc = self._service()
+            svc.users().messages().modify(
+                userId=self.user_id,
+                id=message_id,
+                body={"removeLabelIds": ["UNREAD"]},
+            ).execute()
+
+        self._with_retry(f"mark_read {message_id}", _mark)
 
 
 def _decode_b64url(value: str) -> bytes:

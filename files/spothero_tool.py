@@ -159,6 +159,8 @@ class SpotHeroClient:
                 continue
             if item.get("is_expired"):
                 continue
+            if _is_cancelled_rule(item):
+                continue
 
             vf_raw = item.get("valid_from")
             vt_raw = item.get("valid_to")
@@ -526,8 +528,21 @@ def _rule_specificity_key(
     return (exact_tier, contained_tier, single_day_same, -duration_sec, overlap_min, r_from)
 
 
+def _is_cancelled_rule(raw: Dict[str, Any]) -> bool:
+    """Treat title/description 'cancelled' as inactive even if API status is enabled."""
+    if not isinstance(raw, dict):
+        return False
+    blob = " ".join(
+        str(raw.get(k) or "")
+        for k in ("title", "description", "name", "label")
+    ).lower()
+    return "cancel" in blob
+
+
 def _is_rule_exception(raw: Dict[str, Any]) -> bool:
     if not isinstance(raw, dict):
+        return False
+    if _is_cancelled_rule(raw):
         return False
     if raw.get("is_exception") is True:
         return True
@@ -571,18 +586,12 @@ def _pick_calendar_day_controller(
     ev: EventInfo,
 ) -> Optional[InventoryRule]:
     """
-    Choose a same-calendar-day IE for an event.
-
-    - One same-day IE on that date: use it for any event starting that day
-      (event may extend past the IE end — e.g. evening events on a daytime IE).
-    - Multiple same-day IEs: only rules that overlap the event time are candidates;
-      pick contained > most overlap > narrowest window.
+    Choose a same-calendar-day IE only when it overlaps the event time.
+    A 3–5 PM IE must not control a 7–10 PM event (baseline applies instead).
+    Events that start inside the window and run a bit past IE end still overlap.
     """
     if not cal_day_rules:
         return None
-
-    if len(cal_day_rules) == 1:
-        return cal_day_rules[0]
 
     overlapping = [
         r for r in cal_day_rules
@@ -593,6 +602,40 @@ def _pick_calendar_day_controller(
 
     overlapping.sort(key=lambda r: _same_day_overlap_key(r, ev), reverse=True)
     return overlapping[0]
+
+
+def _pick_multiday_date_cover(
+    rules: List[InventoryRule],
+    ev: EventInfo,
+) -> Optional[InventoryRule]:
+    """
+    Multi-day IE whose calendar range includes the event start date.
+    Used when the event starts after IE valid_to time on the end date
+    (e.g. IE Sep 15 7AM–Sep 16 7AM, event Sep 16 5PM → still 1 stall).
+    """
+    ev_start = ev.event_starts_local
+    if not ev_start:
+        return None
+    ev_date = ev_start.date()
+    covers: List[InventoryRule] = []
+    for r in rules:
+        if not _is_rule_exception(r.raw):
+            continue
+        r_from_d = r.valid_from_local.date()
+        r_to_d = r.valid_to_local.date()
+        if r_from_d == r_to_d:
+            continue
+        if r_from_d <= ev_date <= r_to_d:
+            covers.append(r)
+    if not covers:
+        return None
+    covers.sort(
+        key=lambda r: (
+            max(0, int((r.valid_to_local - r.valid_from_local).total_seconds())),
+            r.valid_from_local,
+        )
+    )
+    return covers[0]
 
 
 def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[Optional[int], Optional[InventoryRule]]:
@@ -627,15 +670,18 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
         )
         contenders.append((r, minutes, _is_exact_window_match(ev, r), contained))
 
-    if not contenders:
-        return None, None
+    if contenders:
+        contenders.sort(
+            key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
+            reverse=True,
+        )
+        controller = contenders[0][0]
+        return controller.quantity, controller
 
-    contenders.sort(
-        key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
-        reverse=True,
-    )
-    controller = contenders[0][0]
-    return controller.quantity, controller
+    date_cover = _pick_multiday_date_cover(rules, ev)
+    if date_cover is not None:
+        return date_cover.quantity, date_cover
+    return None, None
 
 
 # ---------- Teams notifier (Adaptive Card) ----------

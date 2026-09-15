@@ -480,11 +480,27 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
     return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
 
 
+def _ie_end_covering_midnight(valid_to_local: dt.datetime) -> dt.datetime:
+    """
+    SpotHero often stores Valid To as 12:00 AM on the last date, meaning that
+    whole calendar day (landlord Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
+    """
+    if (
+        valid_to_local.hour == 0
+        and valid_to_local.minute == 0
+        and valid_to_local.second == 0
+        and valid_to_local.microsecond == 0
+    ):
+        return valid_to_local + dt.timedelta(days=1)
+    return valid_to_local
+
+
 def _effective_ie_window(rule: InventoryRule) -> Tuple[dt.datetime, dt.datetime]:
-    """IE window plus start/end grace (default −2h / +1h)."""
+    """IE window plus start/end grace (default −2h / +1h). Midnight valid_to covers that date."""
     start_grace = dt.timedelta(hours=IE_START_GRACE_HOURS)
     end_grace = dt.timedelta(hours=IE_END_GRACE_HOURS)
-    return rule.valid_from_local - start_grace, rule.valid_to_local + end_grace
+    end_local = _ie_end_covering_midnight(rule.valid_to_local)
+    return rule.valid_from_local - start_grace, end_local + end_grace
 
 
 def _event_overlaps_effective_ie(ev: EventInfo, rule: InventoryRule) -> bool:

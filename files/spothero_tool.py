@@ -480,17 +480,32 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
     return (ev.event_starts_local == r.valid_from_local) and (ev.event_ends_local == r.valid_to_local)
 
 
-def _ie_end_covering_midnight(valid_to_local: dt.datetime) -> dt.datetime:
-    """
-    SpotHero often stores Valid To as 12:00 AM on the last date, meaning that
-    whole calendar day (landlord Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
-    """
-    if (
+def _is_midnight_valid_to(valid_to_local: dt.datetime) -> bool:
+    """True when Valid To is exactly 12:00 AM (covers that entire last calendar day)."""
+    return (
         valid_to_local.hour == 0
         and valid_to_local.minute == 0
         and valid_to_local.second == 0
         and valid_to_local.microsecond == 0
-    ):
+    )
+
+
+def _is_overnight_valid_to(valid_to_local: dt.datetime) -> bool:
+    """
+    Valid To after midnight through 6:00 AM — the previous night's IE, not the next evening.
+    12:00 AM is midnight (Dean St), not overnight (Kenmore 1:30 AM / Highland 12:30 AM).
+    """
+    t = valid_to_local.time()
+    return dt.time(0, 0) < t <= dt.time(6, 0)
+
+
+def _ie_end_covering_midnight(valid_to_local: dt.datetime) -> dt.datetime:
+    """
+    SpotHero often stores Valid To as 12:00 AM on the last date, meaning that
+    whole calendar day (landlord Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
+    Overnight ends (12:01–6:00 AM) are not expanded.
+    """
+    if _is_midnight_valid_to(valid_to_local):
         return valid_to_local + dt.timedelta(days=1)
     return valid_to_local
 
@@ -558,14 +573,23 @@ def _pick_narrowest_multiday_date_cover(
     return covers[0]
 
 
+def _overnight_end_date_without_overlap(rule: InventoryRule, ev: EventInfo) -> bool:
+    """
+    Overnight IEs (Valid To 12:01 AM–6:00 AM) apply to the end calendar date only
+    via time overlap + grace. They must not date-cover that evening
+    (Kenmore Oct 9 4:30 PM→Oct 10 1:30 AM must not set Oct 10 7:30 PM).
+    """
+    if not ev.event_starts_local or not _is_overnight_valid_to(rule.valid_to_local):
+        return False
+    if ev.event_starts_local.date() != rule.valid_to_local.date():
+        return False
+    return not _event_overlaps_effective_ie(ev, rule)
+
+
 def _any_exception_ie_covers_event_start(rules: List[InventoryRule], ev: EventInfo) -> bool:
-    """True if any IE overlaps (with grace) or a multi-day IE covers the event date."""
-    for r in rules:
-        if not _is_rule_exception(r.raw):
-            continue
-        if _event_overlaps_effective_ie(ev, r) or _multiday_ie_covers_event_date(r, ev):
-            return True
-    return False
+    """True when an IE actually controls the event (same result as the picker)."""
+    _, controller = _containing_controller(rules, ev)
+    return controller is not None
 
 
 def _rule_specificity_key(
@@ -615,7 +639,10 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
 
     1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
     2. Narrowest multi-day IE whose calendar dates include the event date
-       (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3).
+       (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
+       Overnight Valid To (12:01 AM–6:00 AM) does not control the end-date
+       evening and does not fall through to a wider IE (baseline instead).
+       Midnight Valid To (12:00 AM) still covers that entire last day.
     3. Any other overlapping IE, most specific first.
     """
     if not ev.event_starts_local or not ev.event_ends_local:
@@ -647,6 +674,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
 
     date_cover = _pick_narrowest_multiday_date_cover(rules, ev)
     if date_cover is not None:
+        if _overnight_end_date_without_overlap(date_cover, ev):
+            return None, None
         return date_cover.quantity, date_cover
 
     if other_overlap:

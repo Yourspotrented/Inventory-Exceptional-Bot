@@ -88,11 +88,33 @@ class HighlandOvernightTests(unittest.TestCase):
         self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
 
 
-class DeanStMidnightTests(unittest.TestCase):
-    """Midnight Valid To still covers that entire last calendar day."""
+class EgmontMidnightTests(unittest.TestCase):
+    """76 Egmont: Sep 15 4:30 PM → Sep 16 12:00 AM @ 3. Baseline is 2."""
 
-    def test_oct_8_evening_uses_midnight_ie(self) -> None:
+    def setUp(self) -> None:
+        self.ie = _rule(_dt(2026, 9, 15, 16, 30), _dt(2026, 9, 16, 0, 0), 3)
+        self.rules = [self.ie]
+
+    def test_sep_15_evening_uses_ie(self) -> None:
+        ev = _event(_dt(2026, 9, 15, 20, 0), _dt(2026, 9, 16, 0, 0), inventory=3)
+        self.assertEqual(_qty(self.rules, ev), 3)
+
+    def test_sep_16_evening_stays_at_baseline(self) -> None:
+        ev = _event(_dt(2026, 9, 16, 20, 0), _dt(2026, 9, 17, 0, 0), inventory=2)
+        self.assertIsNone(_qty(self.rules, ev))
+        self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
+
+
+class DeanStMidnightTests(unittest.TestCase):
+    """Multi-day midnight Valid To still covers that entire last calendar day."""
+
+    def test_oct_8_evening_uses_midnight_ie_through_oct_9(self) -> None:
         ie = _rule(_dt(2026, 10, 6, 0, 0), _dt(2026, 10, 9, 0, 0), 0)
+        ev = _event(_dt(2026, 10, 8, 18, 0), _dt(2026, 10, 8, 22, 0), inventory=10)
+        self.assertEqual(_qty([ie], ev), 0)
+
+    def test_oct_8_evening_uses_midnight_ie_ending_oct_8(self) -> None:
+        ie = _rule(_dt(2026, 10, 6, 0, 0), _dt(2026, 10, 8, 0, 0), 0)
         ev = _event(_dt(2026, 10, 8, 18, 0), _dt(2026, 10, 8, 22, 0), inventory=10)
         self.assertEqual(_qty([ie], ev), 0)
 

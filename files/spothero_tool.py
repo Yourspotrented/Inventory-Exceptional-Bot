@@ -493,28 +493,41 @@ def _is_midnight_valid_to(valid_to_local: dt.datetime) -> bool:
 def _is_overnight_valid_to(valid_to_local: dt.datetime) -> bool:
     """
     Valid To after midnight through 6:00 AM — the previous night's IE, not the next evening.
-    12:00 AM is midnight (Dean St), not overnight (Kenmore 1:30 AM / Highland 12:30 AM).
+    12:00 AM is midnight (Dean St / Egmont), not this band (Kenmore 1:30 AM).
     """
     t = valid_to_local.time()
     return dt.time(0, 0) < t <= dt.time(6, 0)
 
 
-def _ie_end_covering_midnight(valid_to_local: dt.datetime) -> dt.datetime:
+def _is_evening_until_midnight(rule: InventoryRule) -> bool:
     """
-    SpotHero often stores Valid To as 12:00 AM on the last date, meaning that
-    whole calendar day (landlord Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
-    Overnight ends (12:01–6:00 AM) are not expanded.
+    Evening start → next calendar day 12:00 AM (Egmont Sep 15 4:30 PM → Sep 16 12:00 AM).
+    That IE ends at midnight. It does not own the Valid To date's evening.
+    Multi-day midnight→midnight ranges (Dean St Oct 6 12:00 AM → Oct 8 12:00 AM) are not this.
     """
-    if _is_midnight_valid_to(valid_to_local):
-        return valid_to_local + dt.timedelta(days=1)
-    return valid_to_local
+    if not _is_midnight_valid_to(rule.valid_to_local):
+        return False
+    if rule.valid_to_local.date() != rule.valid_from_local.date() + dt.timedelta(days=1):
+        return False
+    return not _is_midnight_valid_to(rule.valid_from_local)
+
+
+def _ie_end_covering_midnight(rule: InventoryRule) -> dt.datetime:
+    """
+    Multi-day midnight Valid To covers that last calendar day
+    (Dean St Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
+    Evening-until-midnight and overnight ends are not expanded.
+    """
+    if _is_midnight_valid_to(rule.valid_to_local) and not _is_evening_until_midnight(rule):
+        return rule.valid_to_local + dt.timedelta(days=1)
+    return rule.valid_to_local
 
 
 def _effective_ie_window(rule: InventoryRule) -> Tuple[dt.datetime, dt.datetime]:
     """IE window plus start/end grace (default −2h / +1h). Midnight valid_to covers that date."""
     start_grace = dt.timedelta(hours=IE_START_GRACE_HOURS)
     end_grace = dt.timedelta(hours=IE_END_GRACE_HOURS)
-    end_local = _ie_end_covering_midnight(rule.valid_to_local)
+    end_local = _ie_end_covering_midnight(rule)
     return rule.valid_from_local - start_grace, end_local + end_grace
 
 
@@ -575,11 +588,17 @@ def _pick_narrowest_multiday_date_cover(
 
 def _overnight_end_date_without_overlap(rule: InventoryRule, ev: EventInfo) -> bool:
     """
-    Overnight IEs (Valid To 12:01 AM–6:00 AM) apply to the end calendar date only
-    via time overlap + grace. They must not date-cover that evening
-    (Kenmore Oct 9 4:30 PM→Oct 10 1:30 AM must not set Oct 10 7:30 PM).
+    Overnight IEs (Valid To 12:01 AM–6:00 AM) and evening→next-midnight IEs
+    apply to the end calendar date only via time overlap + grace.
+    They must not date-cover that evening
+    (Kenmore 1:30 AM / Egmont 12:00 AM must not set the next night).
     """
-    if not ev.event_starts_local or not _is_overnight_valid_to(rule.valid_to_local):
+    if not ev.event_starts_local:
+        return False
+    if not (
+        _is_overnight_valid_to(rule.valid_to_local)
+        or _is_evening_until_midnight(rule)
+    ):
         return False
     if ev.event_starts_local.date() != rule.valid_to_local.date():
         return False
@@ -640,9 +659,10 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
     2. Narrowest multi-day IE whose calendar dates include the event date
        (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
-       Overnight Valid To (12:01 AM–6:00 AM) does not control the end-date
-       evening and does not fall through to a wider IE (baseline instead).
-       Midnight Valid To (12:00 AM) still covers that entire last day.
+       Overnight Valid To (12:01 AM–6:00 AM) and evening→next 12:00 AM
+       (Egmont) do not control the end-date evening and do not fall through
+       to a wider IE (baseline instead). Multi-day midnight→midnight
+       (Dean St) still covers that entire last day.
     3. Any other overlapping IE, most specific first.
     """
     if not ev.event_starts_local or not ev.event_ends_local:

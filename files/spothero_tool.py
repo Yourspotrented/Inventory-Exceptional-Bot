@@ -36,6 +36,8 @@ APPLY_BASELINE_INVENTORY_WHEN_NO_IE = (
 # Soft IE window: event may start a bit before valid_from or end a bit after valid_to.
 IE_START_GRACE_HOURS = max(0.0, float(os.getenv("IE_START_GRACE_HOURS", "2")))
 IE_END_GRACE_HOURS = max(0.0, float(os.getenv("IE_END_GRACE_HOURS", "1")))
+# Pull recently-ended IEs so a 5 PM event still matches an IE that ended at 7 PM.
+IE_RULES_LOOKBACK_DAYS = max(0, int(os.getenv("IE_RULES_LOOKBACK_DAYS", "7")))
 
 # ---------- Models (LOCAL time only) ----------
 @dataclass
@@ -160,8 +162,8 @@ class SpotHeroClient:
                 continue
             if item.get("status") != "enabled":
                 continue
-            if item.get("is_expired"):
-                continue
+            # Keep expired IEs. A rule that ended at 7 PM must still control
+            # a same-day 5 PM event after the bot runs later that night.
 
             vf_raw = item.get("valid_from")
             vt_raw = item.get("valid_to")
@@ -558,12 +560,29 @@ def _is_same_calendar_day_ie(rule: InventoryRule) -> bool:
     return d0 == d1
 
 
+def _rule_duration_sec(rule: InventoryRule) -> int:
+    return max(0, int((rule.valid_to_local - rule.valid_from_local).total_seconds()))
+
+
 def _multiday_ie_covers_event_date(rule: InventoryRule, ev: EventInfo) -> bool:
     if not ev.event_starts_local or _is_same_calendar_day_ie(rule):
         return False
     ev_date = ev.event_starts_local.date()
     d0, d1 = _rule_date_span(rule)
-    return d0 <= ev_date <= d1
+    if not (d0 <= ev_date <= d1):
+        return False
+    # A 7 PM Valid To must not date-cover a 7:30 PM event on that same last day.
+    # Midnight / overnight ends keep their existing last-day behavior.
+    if (
+        ev_date == d1
+        and not _is_midnight_valid_to(rule.valid_to_local)
+        and not _is_overnight_valid_to(rule.valid_to_local)
+        and not _is_evening_until_midnight(rule)
+    ):
+        return _event_start_in_rule_window(ev, rule.valid_from_local, rule.valid_to_local) or (
+            _event_within_local(ev, rule.valid_from_local, rule.valid_to_local)[0]
+        )
+    return True
 
 
 def _pick_narrowest_multiday_date_cover(
@@ -577,13 +596,24 @@ def _pick_narrowest_multiday_date_cover(
     ]
     if not covers:
         return None
-    covers.sort(
-        key=lambda r: (
-            max(0, int((r.valid_to_local - r.valid_from_local).total_seconds())),
-            r.valid_from_local,
-        )
-    )
+    covers.sort(key=lambda r: (_rule_duration_sec(r), r.valid_from_local))
     return covers[0]
+
+
+def _pick_narrowest_start_in_window(
+    rules: List[InventoryRule],
+    ev: EventInfo,
+) -> Optional[InventoryRule]:
+    """Narrowest IE whose actual Valid From/To contains the event start time."""
+    hits = [
+        r for r in rules
+        if _is_rule_exception(r.raw)
+        and _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local)
+    ]
+    if not hits:
+        return None
+    hits.sort(key=lambda r: (_rule_duration_sec(r), r.valid_from_local))
+    return hits[0]
 
 
 def _overnight_end_date_without_overlap(rule: InventoryRule, ev: EventInfo) -> bool:
@@ -657,13 +687,15 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     Pick the inventory-exception that should control an event.
 
     1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
-    2. Narrowest multi-day IE whose calendar dates include the event date
+    2. Narrowest IE whose actual window contains the event start
+       (Highland 5 PM event vs 1-stall ending 7 PM beats cancelled Sep 11–18 @ 2).
+    3. Narrowest multi-day IE whose calendar dates include the event date
        (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
        Overnight Valid To (12:01 AM–6:00 AM) and evening→next 12:00 AM
        (Egmont) do not control the end-date evening and do not fall through
        to a wider IE (baseline instead). Multi-day midnight→midnight
        (Dean St) still covers that entire last day.
-    3. Any other overlapping IE, most specific first.
+    4. Any other overlapping IE, most specific first.
     """
     if not ev.event_starts_local or not ev.event_ends_local:
         return None, None
@@ -692,10 +724,17 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
         controller = same_day_overlap[0][0]
         return controller.quantity, controller
 
+    start_hit = _pick_narrowest_start_in_window(rules, ev)
     date_cover = _pick_narrowest_multiday_date_cover(rules, ev)
+    if date_cover is not None and _overnight_end_date_without_overlap(date_cover, ev):
+        return None, None
+    if start_hit is not None and date_cover is not None:
+        if _rule_duration_sec(date_cover) < _rule_duration_sec(start_hit):
+            return date_cover.quantity, date_cover
+        return start_hit.quantity, start_hit
+    if start_hit is not None:
+        return start_hit.quantity, start_hit
     if date_cover is not None:
-        if _overnight_end_date_without_overlap(date_cover, ev):
-            return None, None
         return date_cover.quantity, date_cover
 
     if other_overlap:
@@ -1242,7 +1281,10 @@ def run_update_for_facility_all_rules(
     facility_name = fac_detail.get("name", "") if isinstance(fac_detail, dict) else ""
     facility_title = fac_detail.get("title", "") if isinstance(fac_detail, dict) else ""
 
-    rules = client.get_inventory_rules_range(facility_id=facility_id, range_start_date=today_local, tz_name=tz_name)
+    rules_from = today_local - dt.timedelta(days=IE_RULES_LOOKBACK_DAYS)
+    rules = client.get_inventory_rules_range(
+        facility_id=facility_id, range_start_date=rules_from, tz_name=tz_name
+    )
     if not rules:
         raise RuntimeError(f"No inventory rules for facility {facility_id} on {today_local} (tz={tz_name})")
 
@@ -1269,8 +1311,9 @@ def run_update_for_facility_all_rules(
     for r in (rules if debug else []):
         client._log(debug, "   - rule", "| qty=", r.quantity, "| valid_from_local=", r.valid_from_local, "| valid_to_local=", r.valid_to_local)
 
-    vf_list = [r.valid_from_local.date() for r in rules]
-    vt_list = [r.valid_to_local.date() for r in rules]
+    window_rules = [r for r in rules if r.valid_to_local.date() >= today_local] or rules
+    vf_list = [r.valid_from_local.date() for r in window_rules]
+    vt_list = [r.valid_to_local.date() for r in window_rules]
     global_from = min(vf_list)
     global_to = max(vt_list)
     client._log(debug, f"[global window local] from={global_from} to={global_to}")

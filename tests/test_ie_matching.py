@@ -134,6 +134,27 @@ class BrowneSameDayTests(unittest.TestCase):
         self.assertEqual(_qty([ie], ev), 0)
 
 
+class HighlandStartInWindowTests(unittest.TestCase):
+    """3737 Highland: 1-stall to Sep 16 7 PM vs cancelled 2-stall Sep 11–18."""
+
+    def setUp(self) -> None:
+        self.one = _rule(_dt(2026, 9, 15, 12, 0), _dt(2026, 9, 16, 19, 0), 1)
+        self.two = _rule(_dt(2026, 9, 11, 23, 0), _dt(2026, 9, 18, 23, 0), 2)
+        self.rules = [self.one, self.two]
+
+    def test_sep_16_5pm_uses_1_stall(self) -> None:
+        ev = _event(_dt(2026, 9, 16, 17, 0), _dt(2026, 9, 16, 22, 0), inventory=1)
+        self.assertEqual(_qty(self.rules, ev), 1)
+
+    def test_sep_16_730pm_after_1_stall_uses_cancelled_2(self) -> None:
+        ev = _event(_dt(2026, 9, 16, 19, 30), _dt(2026, 9, 16, 22, 30), inventory=1)
+        self.assertEqual(_qty(self.rules, ev), 2)
+
+    def test_sep_17_uses_cancelled_2(self) -> None:
+        ev = _event(_dt(2026, 9, 17, 17, 0), _dt(2026, 9, 17, 22, 0), inventory=2)
+        self.assertEqual(_qty(self.rules, ev), 2)
+
+
 class WestlandMultidayTests(unittest.TestCase):
     """Multi-day 8 PM–6 AM still controls the middle evening."""
 

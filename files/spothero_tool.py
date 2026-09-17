@@ -616,6 +616,11 @@ def _pick_narrowest_start_in_window(
     return hits[0]
 
 
+def _ie_starts_at_or_after(rule: InventoryRule, prior: InventoryRule) -> bool:
+    """True when rule begins at or after prior Valid To (back-to-back next IE)."""
+    return rule.valid_from_local >= prior.valid_to_local
+
+
 def _overnight_end_date_without_overlap(rule: InventoryRule, ev: EventInfo) -> bool:
     """
     Overnight IEs (Valid To 12:01 AM–6:00 AM) and evening→next-midnight IEs
@@ -693,8 +698,9 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
        (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
        Overnight Valid To (12:01 AM–6:00 AM) and evening→next 12:00 AM
        (Egmont) do not control the end-date evening and do not fall through
-       to a wider IE (baseline instead). Multi-day midnight→midnight
-       (Dean St) still covers that entire last day.
+       to a wider older IE (baseline instead). A next IE that starts at or
+       after that overnight ended still applies (Burling 0-stall → 1-stall).
+       Multi-day midnight→midnight (Dean St) still covers that entire last day.
     4. Any other overlapping IE, most specific first.
     """
     if not ev.event_starts_local or not ev.event_ends_local:
@@ -727,6 +733,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     start_hit = _pick_narrowest_start_in_window(rules, ev)
     date_cover = _pick_narrowest_multiday_date_cover(rules, ev)
     if date_cover is not None and _overnight_end_date_without_overlap(date_cover, ev):
+        if start_hit is not None and _ie_starts_at_or_after(start_hit, date_cover):
+            return start_hit.quantity, start_hit
         return None, None
     if start_hit is not None and date_cover is not None:
         if _rule_duration_sec(date_cover) < _rule_duration_sec(start_hit):

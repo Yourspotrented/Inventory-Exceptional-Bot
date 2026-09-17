@@ -155,6 +155,29 @@ class HighlandStartInWindowTests(unittest.TestCase):
         self.assertEqual(_qty(self.rules, ev), 2)
 
 
+class BurlingNextIeTests(unittest.TestCase):
+    """2828 N Burling: 0-stall ends midnight, 1-stall starts midnight."""
+
+    def setUp(self) -> None:
+        self.zero = _rule(_dt(2026, 9, 15, 17, 0), _dt(2026, 9, 16, 0, 0), 0)
+        self.one = _rule(_dt(2026, 9, 16, 0, 0), _dt(2026, 9, 17, 7, 0), 1)
+        self.cancelled = _rule(_dt(2026, 9, 2, 0, 0), _dt(2026, 9, 16, 0, 0), 1)
+        self.rules = [self.zero, self.one, self.cancelled]
+
+    def test_sep_16_evening_uses_1_stall_not_baseline(self) -> None:
+        ev = _event(_dt(2026, 9, 16, 18, 40), _dt(2026, 9, 16, 21, 40), inventory=1)
+        self.assertEqual(_qty(self.rules, ev), 1)
+        self.assertTrue(_any_exception_ie_covers_event_start(self.rules, ev))
+
+    def test_sep_16_evening_is_not_zero(self) -> None:
+        ev = _event(_dt(2026, 9, 16, 18, 40), _dt(2026, 9, 16, 21, 40), inventory=1)
+        self.assertNotEqual(_qty(self.rules, ev), 0)
+
+    def test_sep_15_evening_uses_zero(self) -> None:
+        ev = _event(_dt(2026, 9, 15, 18, 40), _dt(2026, 9, 15, 21, 40), inventory=2)
+        self.assertEqual(_qty(self.rules, ev), 0)
+
+
 class WestlandMultidayTests(unittest.TestCase):
     """Multi-day 8 PM–6 AM still controls the middle evening."""
 

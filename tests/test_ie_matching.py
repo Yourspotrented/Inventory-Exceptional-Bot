@@ -178,6 +178,27 @@ class BurlingNextIeTests(unittest.TestCase):
         self.assertEqual(_qty(self.rules, ev), 0)
 
 
+class StoneholmSameDayHandoffTests(unittest.TestCase):
+    """12 Stoneholm: 5–8 PM @ 24 then 8–11 PM @ 25."""
+
+    def setUp(self) -> None:
+        self.r24 = _rule(_dt(2026, 9, 22, 17, 0), _dt(2026, 9, 22, 20, 0), 24)
+        self.r25 = _rule(_dt(2026, 9, 22, 20, 0), _dt(2026, 9, 22, 23, 0), 25)
+        self.rules = [self.r24, self.r25]
+
+    def test_630pm_stays_24(self) -> None:
+        ev = _event(_dt(2026, 9, 22, 18, 30), _dt(2026, 9, 22, 21, 30), inventory=24)
+        self.assertEqual(_qty(self.rules, ev), 24)
+
+    def test_645pm_stays_24(self) -> None:
+        ev = _event(_dt(2026, 9, 22, 18, 45), _dt(2026, 9, 22, 21, 45), inventory=24)
+        self.assertEqual(_qty(self.rules, ev), 24)
+
+    def test_800pm_uses_25(self) -> None:
+        ev = _event(_dt(2026, 9, 22, 20, 0), _dt(2026, 9, 22, 23, 0), inventory=25)
+        self.assertEqual(_qty(self.rules, ev), 25)
+
+
 class WestlandMultidayTests(unittest.TestCase):
     """Multi-day 8 PM–6 AM still controls the middle evening."""
 

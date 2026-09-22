@@ -550,6 +550,17 @@ def _event_start_in_rule_window(
     return win_from_local <= s <= win_to_local
 
 
+def _event_start_in_same_day_ie(ev: EventInfo, rule: InventoryRule) -> bool:
+    """
+    Actual same-day window. Valid To is exclusive so an 8:00 PM start belongs
+    to 8–11 PM @ 25, not the earlier 5–8 PM @ 24 (Stoneholm).
+    """
+    s = ev.event_starts_local
+    if not s:
+        return False
+    return rule.valid_from_local <= s < rule.valid_to_local
+
+
 def _rule_date_span(rule: InventoryRule) -> Tuple[dt.date, dt.date]:
     """Inclusive calendar dates of an IE (midnight valid_to still counts that date)."""
     return rule.valid_from_local.date(), rule.valid_to_local.date()
@@ -692,6 +703,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     Pick the inventory-exception that should control an event.
 
     1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
+       If more than one hits, the IE whose actual window contains the event
+       start wins (Stoneholm 6:30 PM stays 24, not the 8–11 PM @ 25).
     2. Narrowest IE whose actual window contains the event start
        (Highland 5 PM event vs 1-stall ending 7 PM beats cancelled Sep 11–18 @ 2).
     3. Narrowest multi-day IE whose calendar dates include the event date
@@ -723,11 +736,16 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
             other_overlap.append(row)
 
     if same_day_overlap:
-        same_day_overlap.sort(
+        start_owned = [
+            row for row in same_day_overlap
+            if _event_start_in_same_day_ie(ev, row[0])
+        ]
+        pool = start_owned or same_day_overlap
+        pool.sort(
             key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
             reverse=True,
         )
-        controller = same_day_overlap[0][0]
+        controller = pool[0][0]
         return controller.quantity, controller
 
     start_hit = _pick_narrowest_start_in_window(rules, ev)

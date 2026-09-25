@@ -615,7 +615,7 @@ def _pick_narrowest_start_in_window(
     rules: List[InventoryRule],
     ev: EventInfo,
 ) -> Optional[InventoryRule]:
-    """Narrowest IE whose actual Valid From/To contains the event start time."""
+    """Lowest-qty IE whose actual Valid From/To contains the event start time."""
     hits = [
         r for r in rules
         if _is_rule_exception(r.raw)
@@ -623,7 +623,7 @@ def _pick_narrowest_start_in_window(
     ]
     if not hits:
         return None
-    hits.sort(key=lambda r: (_rule_duration_sec(r), r.valid_from_local))
+    hits.sort(key=lambda r: (r.quantity, _rule_duration_sec(r), r.valid_from_local))
     return hits[0]
 
 
@@ -705,8 +705,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
        If more than one hits, the IE whose actual window contains the event
        start wins (Stoneholm 6:30 PM stays 24, not the 8–11 PM @ 25).
-    2. Narrowest IE whose actual window contains the event start
-       (Highland 5 PM event vs 1-stall ending 7 PM beats cancelled Sep 11–18 @ 2).
+    2. Lowest-qty IE whose actual window contains the event start
+       (5-stall beats a shorter cancelled 6-stall on the same dates).
     3. Narrowest multi-day IE whose calendar dates include the event date
        (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
        Overnight Valid To (12:01 AM–6:00 AM) and evening→next 12:00 AM
@@ -741,6 +741,9 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
             if _event_start_in_same_day_ie(ev, row[0])
         ]
         pool = start_owned or same_day_overlap
+        if start_owned:
+            min_qty = min(row[0].quantity for row in start_owned)
+            pool = [row for row in start_owned if row[0].quantity == min_qty]
         pool.sort(
             key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
             reverse=True,
@@ -755,6 +758,13 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
             return start_hit.quantity, start_hit
         return None, None
     if start_hit is not None and date_cover is not None:
+        date_cover_owns_start = _event_start_in_rule_window(
+            ev, date_cover.valid_from_local, date_cover.valid_to_local
+        )
+        if date_cover_owns_start:
+            if date_cover.quantity < start_hit.quantity:
+                return date_cover.quantity, date_cover
+            return start_hit.quantity, start_hit
         if _rule_duration_sec(date_cover) < _rule_duration_sec(start_hit):
             return date_cover.quantity, date_cover
         return start_hit.quantity, start_hit

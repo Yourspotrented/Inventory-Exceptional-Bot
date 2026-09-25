@@ -199,6 +199,28 @@ class StoneholmSameDayHandoffTests(unittest.TestCase):
         self.assertEqual(_qty(self.rules, ev), 25)
 
 
+class LeastStallsStartInWindowTests(unittest.TestCase):
+    """5-stall and shorter cancelled 6-stall both cover Sep 25–26."""
+
+    def setUp(self) -> None:
+        self.five = _rule(_dt(2026, 9, 22, 12, 30), _dt(2026, 9, 27, 23, 0), 5)
+        self.canc6 = _rule(_dt(2026, 9, 23, 0, 0), _dt(2026, 9, 27, 23, 0), 6)
+        self.cont6 = _rule(_dt(2026, 9, 27, 23, 0), _dt(2026, 9, 29, 20, 0), 6)
+        self.rules = [self.five, self.canc6, self.cont6]
+
+    def test_sep_25_uses_5_not_cancelled_6(self) -> None:
+        ev = _event(_dt(2026, 9, 25, 19, 0), _dt(2026, 9, 25, 22, 0), inventory=6)
+        self.assertEqual(_qty(self.rules, ev), 5)
+
+    def test_sep_26_uses_5_not_cancelled_6(self) -> None:
+        ev = _event(_dt(2026, 9, 26, 19, 0), _dt(2026, 9, 26, 22, 0), inventory=6)
+        self.assertEqual(_qty(self.rules, ev), 5)
+
+    def test_sep_28_uses_cont_6_after_five_ends(self) -> None:
+        ev = _event(_dt(2026, 9, 28, 19, 0), _dt(2026, 9, 28, 22, 0), inventory=6)
+        self.assertEqual(_qty(self.rules, ev), 6)
+
+
 class WestlandMultidayTests(unittest.TestCase):
     """Multi-day 8 PM–6 AM still controls the middle evening."""
 

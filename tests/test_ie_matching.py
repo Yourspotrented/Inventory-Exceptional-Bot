@@ -106,17 +106,51 @@ class EgmontMidnightTests(unittest.TestCase):
 
 
 class DeanStMidnightTests(unittest.TestCase):
-    """Multi-day midnight Valid To still covers that entire last calendar day."""
+    """Midnight Valid To 12:00 AM on D does not cover D evening."""
 
-    def test_oct_8_evening_uses_midnight_ie_through_oct_9(self) -> None:
+    def test_oct_8_evening_uses_ie_through_oct_9_midnight(self) -> None:
         ie = _rule(_dt(2026, 10, 6, 0, 0), _dt(2026, 10, 9, 0, 0), 0)
         ev = _event(_dt(2026, 10, 8, 18, 0), _dt(2026, 10, 8, 22, 0), inventory=10)
         self.assertEqual(_qty([ie], ev), 0)
 
-    def test_oct_8_evening_uses_midnight_ie_ending_oct_8(self) -> None:
+    def test_oct_8_evening_not_covered_when_valid_to_is_oct_8_midnight(self) -> None:
         ie = _rule(_dt(2026, 10, 6, 0, 0), _dt(2026, 10, 8, 0, 0), 0)
         ev = _event(_dt(2026, 10, 8, 18, 0), _dt(2026, 10, 8, 22, 0), inventory=10)
-        self.assertEqual(_qty([ie], ev), 0)
+        self.assertIsNone(_qty([ie], ev))
+
+
+class KenmoreMidnightEndTests(unittest.TestCase):
+    """4909 N Kenmore: Sep 23 12:00 AM → Oct 1 12:00 AM @ 15. Baseline 16."""
+
+    def setUp(self) -> None:
+        self.ie = _rule(_dt(2026, 9, 23, 0, 0), _dt(2026, 10, 1, 0, 0), 15)
+        self.rules = [self.ie]
+
+    def test_sep_30_evening_uses_15(self) -> None:
+        ev = _event(_dt(2026, 9, 30, 19, 0), _dt(2026, 9, 30, 22, 0), inventory=15)
+        self.assertEqual(_qty(self.rules, ev), 15)
+
+    def test_oct_1_evening_stays_at_baseline(self) -> None:
+        ev = _event(_dt(2026, 10, 1, 19, 0), _dt(2026, 10, 1, 22, 0), inventory=16)
+        self.assertIsNone(_qty(self.rules, ev))
+        self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
+
+
+class BarryMidnightEndTests(unittest.TestCase):
+    """448 W Barry: Sep 29 12:00 AM → Oct 15 12:00 AM @ 2. Baseline 1."""
+
+    def setUp(self) -> None:
+        self.ie = _rule(_dt(2026, 9, 29, 0, 0), _dt(2026, 10, 15, 0, 0), 2)
+        self.rules = [self.ie]
+
+    def test_oct_14_evening_uses_2(self) -> None:
+        ev = _event(_dt(2026, 10, 14, 20, 0), _dt(2026, 10, 14, 22, 0), inventory=2)
+        self.assertEqual(_qty(self.rules, ev), 2)
+
+    def test_oct_15_evening_stays_at_baseline(self) -> None:
+        ev = _event(_dt(2026, 10, 15, 20, 0), _dt(2026, 10, 15, 22, 0), inventory=1)
+        self.assertIsNone(_qty(self.rules, ev))
+        self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
 
 
 class BrowneSameDayTests(unittest.TestCase):

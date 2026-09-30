@@ -483,7 +483,7 @@ def _is_exact_window_match(ev: EventInfo, r: InventoryRule) -> bool:
 
 
 def _is_midnight_valid_to(valid_to_local: dt.datetime) -> bool:
-    """True when Valid To is exactly 12:00 AM (covers that entire last calendar day)."""
+    """True when Valid To is exactly 12:00 AM (end of the previous calendar day)."""
     return (
         valid_to_local.hour == 0
         and valid_to_local.minute == 0
@@ -516,17 +516,15 @@ def _is_evening_until_midnight(rule: InventoryRule) -> bool:
 
 def _ie_end_covering_midnight(rule: InventoryRule) -> dt.datetime:
     """
-    Multi-day midnight Valid To covers that last calendar day
-    (Dean St Oct 6 12:00 AM → Oct 8 12:00 AM covers Oct 8 evening).
-    Evening-until-midnight and overnight ends are not expanded.
+    Valid To 12:00 AM is the start of that date, not that evening
+    (Kenmore Oct 1 12:00 AM does not cover Oct 1 7 PM).
+    Do not expand midnight ends.
     """
-    if _is_midnight_valid_to(rule.valid_to_local) and not _is_evening_until_midnight(rule):
-        return rule.valid_to_local + dt.timedelta(days=1)
     return rule.valid_to_local
 
 
 def _effective_ie_window(rule: InventoryRule) -> Tuple[dt.datetime, dt.datetime]:
-    """IE window plus start/end grace (default −2h / +1h). Midnight valid_to covers that date."""
+    """IE window plus start/end grace (default −2h / +1h)."""
     start_grace = dt.timedelta(hours=IE_START_GRACE_HOURS)
     end_grace = dt.timedelta(hours=IE_END_GRACE_HOURS)
     end_local = _ie_end_covering_midnight(rule)
@@ -562,13 +560,16 @@ def _event_start_in_same_day_ie(ev: EventInfo, rule: InventoryRule) -> bool:
 
 
 def _rule_date_span(rule: InventoryRule) -> Tuple[dt.date, dt.date]:
-    """Inclusive calendar dates of an IE (midnight valid_to still counts that date)."""
-    return rule.valid_from_local.date(), rule.valid_to_local.date()
+    """Inclusive calendar dates an IE may date-cover. Midnight Valid To is exclusive."""
+    start = rule.valid_from_local.date()
+    end = rule.valid_to_local.date()
+    if _is_midnight_valid_to(rule.valid_to_local) and end > start:
+        end = end - dt.timedelta(days=1)
+    return start, end
 
 
 def _is_same_calendar_day_ie(rule: InventoryRule) -> bool:
-    d0, d1 = _rule_date_span(rule)
-    return d0 == d1
+    return rule.valid_from_local.date() == rule.valid_to_local.date()
 
 
 def _rule_duration_sec(rule: InventoryRule) -> int:
@@ -713,7 +714,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
        (Egmont) do not control the end-date evening and do not fall through
        to a wider older IE (baseline instead). A next IE that starts at or
        after that overnight ended still applies (Burling 0-stall → 1-stall).
-       Multi-day midnight→midnight (Dean St) still covers that entire last day.
+       Midnight Valid To (12:00 AM on date D) ends at the start of D and
+       does not control D evening (Kenmore Oct 1 / Barry Oct 15).
     4. Any other overlapping IE, most specific first.
     """
     if not ev.event_starts_local or not ev.event_ends_local:

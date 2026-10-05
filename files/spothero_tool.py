@@ -703,9 +703,10 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
     """
     Pick the inventory-exception that should control an event.
 
-    1. Same-calendar-day IE that overlaps the event (with −2h/+1h grace).
-       If more than one hits, the IE whose actual window contains the event
-       start wins (Stoneholm 6:30 PM stays 24, not the 8–11 PM @ 25).
+    1. Same-calendar-day IE whose actual window contains the event start.
+       +1h end grace must not keep an ended IE (Cherry St 6 PM uses Cont @ 1,
+       not 1:30–5:30 @ 0). If more than one hits, the IE whose actual window
+       contains the event start wins (Stoneholm 6:30 PM stays 24, not 8–11 @ 25).
     2. Lowest-qty IE whose actual window contains the event start
        (5-stall beats a shorter cancelled 6-stall on the same dates).
     3. Narrowest multi-day IE whose calendar dates include the event date
@@ -742,16 +743,15 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
             row for row in same_day_overlap
             if _event_start_in_same_day_ie(ev, row[0])
         ]
-        pool = start_owned or same_day_overlap
         if start_owned:
             min_qty = min(row[0].quantity for row in start_owned)
             pool = [row for row in start_owned if row[0].quantity == min_qty]
-        pool.sort(
-            key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
-            reverse=True,
-        )
-        controller = pool[0][0]
-        return controller.quantity, controller
+            pool.sort(
+                key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),
+                reverse=True,
+            )
+            controller = pool[0][0]
+            return controller.quantity, controller
 
     start_hit = _pick_narrowest_start_in_window(rules, ev)
     date_cover = _pick_narrowest_multiday_date_cover(rules, ev)

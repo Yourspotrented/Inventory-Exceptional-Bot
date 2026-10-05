@@ -233,6 +233,24 @@ class StoneholmSameDayHandoffTests(unittest.TestCase):
         self.assertEqual(_qty(self.rules, ev), 25)
 
 
+class CherrySameDayHandoffTests(unittest.TestCase):
+    """40 Cherry St: Oct 5 1:30–5:30 PM @ 0, then Cont 5:30 PM–Oct 31 @ 1."""
+
+    def setUp(self) -> None:
+        self.zero = _rule(_dt(2026, 10, 5, 13, 30), _dt(2026, 10, 5, 17, 30), 0)
+        self.cont = _rule(_dt(2026, 10, 5, 17, 30), _dt(2026, 10, 31, 23, 0), 1)
+        self.prior = _rule(_dt(2026, 10, 4, 23, 0), _dt(2026, 10, 5, 13, 30), 1)
+        self.rules = [self.zero, self.cont, self.prior]
+
+    def test_afternoon_uses_zero(self) -> None:
+        ev = _event(_dt(2026, 10, 5, 14, 0), _dt(2026, 10, 5, 16, 0), inventory=2)
+        self.assertEqual(_qty(self.rules, ev), 0)
+
+    def test_6pm_uses_cont_one_not_zero(self) -> None:
+        ev = _event(_dt(2026, 10, 5, 18, 0), _dt(2026, 10, 5, 21, 0), inventory=1)
+        self.assertEqual(_qty(self.rules, ev), 1)
+
+
 class LeastStallsStartInWindowTests(unittest.TestCase):
     """5-stall and shorter cancelled 6-stall both cover Sep 25–26."""
 

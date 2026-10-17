@@ -82,10 +82,9 @@ class HighlandOvernightTests(unittest.TestCase):
         ev = _event(_dt(2026, 9, 27, 14, 0), _dt(2026, 9, 27, 17, 0), inventory=2)
         self.assertEqual(_qty(self.rules, ev), 2)
 
-    def test_sep_28_evening_does_not_take_cancelled_or_overnight(self) -> None:
+    def test_sep_28_evening_uses_ie_that_still_contains_start(self) -> None:
         ev = _event(_dt(2026, 9, 28, 18, 0), _dt(2026, 9, 28, 23, 0), inventory=2)
-        self.assertIsNone(_qty(self.rules, ev))
-        self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
+        self.assertEqual(_qty(self.rules, ev), 3)
 
 
 class EgmontMidnightTests(unittest.TestCase):
@@ -134,6 +133,24 @@ class KenmoreMidnightEndTests(unittest.TestCase):
         ev = _event(_dt(2026, 10, 1, 19, 0), _dt(2026, 10, 1, 22, 0), inventory=16)
         self.assertIsNone(_qty(self.rules, ev))
         self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
+
+
+class KenmoreOvernightVsLongIeTests(unittest.TestCase):
+    """4909 N Kenmore: 15-stall through Oct 29 vs overnight 14-stall to Oct 17 2 AM."""
+
+    def setUp(self) -> None:
+        self.long15 = _rule(_dt(2026, 10, 14, 23, 0), _dt(2026, 10, 29, 0, 0), 15)
+        self.over14 = _rule(_dt(2026, 10, 16, 23, 0), _dt(2026, 10, 17, 2, 0), 14)
+        self.rules = [self.long15, self.over14]
+
+    def test_oct_17_evening_uses_15_not_baseline(self) -> None:
+        ev = _event(_dt(2026, 10, 17, 19, 30), _dt(2026, 10, 17, 22, 30), inventory=16)
+        self.assertEqual(_qty(self.rules, ev), 15)
+        self.assertTrue(_any_exception_ie_covers_event_start(self.rules, ev))
+
+    def test_oct_17_early_morning_uses_14(self) -> None:
+        ev = _event(_dt(2026, 10, 17, 0, 30), _dt(2026, 10, 17, 1, 30), inventory=15)
+        self.assertEqual(_qty(self.rules, ev), 14)
 
 
 class BarryMidnightEndTests(unittest.TestCase):

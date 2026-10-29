@@ -707,6 +707,8 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
        +1h end grace must not keep an ended IE (Cherry St 6 PM uses Cont @ 1,
        not 1:30–5:30 @ 0). If more than one hits, the IE whose actual window
        contains the event start wins (Stoneholm 6:30 PM stays 24, not 8–11 @ 25).
+       If a multi-day IE also contains that start and has fewer stalls, use it
+       (Commonwealth 5 PM–2 AM @ 3 beats same-day 5–11 PM @ 4).
     2. Lowest-qty IE whose actual window contains the event start
        (5-stall beats a shorter cancelled 6-stall on the same dates).
     3. Narrowest multi-day IE whose calendar dates include the event date
@@ -747,6 +749,18 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
         ]
         if start_owned:
             min_qty = min(row[0].quantity for row in start_owned)
+            multi_start = [
+                r for r in rules
+                if _is_rule_exception(r.raw)
+                and not _is_same_calendar_day_ie(r)
+                and _event_start_in_rule_window(ev, r.valid_from_local, r.valid_to_local)
+            ]
+            if multi_start:
+                multi_min = min(r.quantity for r in multi_start)
+                if multi_min < min_qty:
+                    winners = [r for r in multi_start if r.quantity == multi_min]
+                    winners.sort(key=lambda r: (_rule_duration_sec(r), r.valid_from_local))
+                    return winners[0].quantity, winners[0]
             pool = [row for row in start_owned if row[0].quantity == min_qty]
             pool.sort(
                 key=lambda c: _rule_specificity_key(c[0], ev, c[1], c[2], contained=c[3]),

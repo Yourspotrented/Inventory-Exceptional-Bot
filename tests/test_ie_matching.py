@@ -268,6 +268,32 @@ class CherrySameDayHandoffTests(unittest.TestCase):
         self.assertEqual(_qty(self.rules, ev), 1)
 
 
+class CommonwealthSameDayVsOvernightTests(unittest.TestCase):
+    """1028 Commonwealth: same-day 4-stall must not beat overnight 3-stall."""
+
+    def setUp(self) -> None:
+        self.over3 = _rule(_dt(2026, 11, 7, 17, 0), _dt(2026, 11, 8, 2, 0), 3)
+        self.same4 = _rule(_dt(2026, 11, 7, 17, 0), _dt(2026, 11, 7, 23, 0), 4)
+        self.oct4 = _rule(_dt(2026, 10, 29, 18, 0), _dt(2026, 10, 29, 12, 0), 4)
+        self.rules = [self.over3, self.same4, self.oct4]
+
+    def test_nov_7_7pm_uses_3_not_4(self) -> None:
+        ev = _event(_dt(2026, 11, 7, 19, 0), _dt(2026, 11, 7, 22, 0), inventory=5)
+        self.assertEqual(_qty(self.rules, ev), 3)
+
+    def test_nov_7_8pm_uses_3_not_4(self) -> None:
+        ev = _event(_dt(2026, 11, 7, 20, 0), _dt(2026, 11, 8, 0, 0), inventory=5)
+        self.assertEqual(_qty(self.rules, ev), 3)
+
+    def test_nov_8_1am_still_uses_3(self) -> None:
+        ev = _event(_dt(2026, 11, 8, 1, 0), _dt(2026, 11, 8, 1, 45), inventory=5)
+        self.assertEqual(_qty(self.rules, ev), 3)
+
+    def test_nov_6_stays_at_baseline(self) -> None:
+        ev = _event(_dt(2026, 11, 6, 20, 0), _dt(2026, 11, 7, 0, 0), inventory=5)
+        self.assertIsNone(_qty(self.rules, ev))
+
+
 class LeastStallsStartInWindowTests(unittest.TestCase):
     """5-stall and shorter cancelled 6-stall both cover Sep 25–26."""
 

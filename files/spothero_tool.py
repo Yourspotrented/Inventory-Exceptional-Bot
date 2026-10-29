@@ -583,6 +583,13 @@ def _multiday_ie_covers_event_date(rule: InventoryRule, ev: EventInfo) -> bool:
     d0, d1 = _rule_date_span(rule)
     if not (d0 <= ev_date <= d1):
         return False
+    # Overnight start date: Fenway 7 AM–10 AM must not take 5 PM–2 AM.
+    # Effective grace keeps Highland Sep 27 2–5 PM on 6:30 PM–12:30 AM @ 2.
+    if ev_date == d0 and (
+        _is_overnight_valid_to(rule.valid_to_local)
+        or _is_evening_until_midnight(rule)
+    ):
+        return _event_overlaps_effective_ie(ev, rule)
     # A 7 PM Valid To must not date-cover a 7:30 PM event on that same last day.
     # Midnight / overnight ends keep their existing last-day behavior.
     if (
@@ -713,6 +720,9 @@ def _containing_controller(rules: List[InventoryRule], ev: EventInfo) -> Tuple[O
        (5-stall beats a shorter cancelled 6-stall on the same dates).
     3. Narrowest multi-day IE whose calendar dates include the event date
        (e.g. Sep 27 6:30 PM–Sep 28 12:30 AM @ 2 beats Sep 18–30 @ 3 on Sep 27).
+       On that overnight start date, a morning event that does not overlap
+       the IE even with grace is not date-covered (Commonwealth Fenway
+       7 AM–10 AM stays baseline; 5 PM–2 AM does not apply).
        Overnight Valid To (12:01 AM–6:00 AM) and evening→next 12:00 AM
        (Egmont) do not control the end-date evening. If another IE still
        contains the event start, use that IE (Kenmore 15-stall through Oct 29

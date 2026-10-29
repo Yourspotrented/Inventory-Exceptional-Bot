@@ -293,6 +293,11 @@ class CommonwealthSameDayVsOvernightTests(unittest.TestCase):
         ev = _event(_dt(2026, 11, 6, 20, 0), _dt(2026, 11, 7, 0, 0), inventory=5)
         self.assertIsNone(_qty(self.rules, ev))
 
+    def test_nov_7_7am_fenway_stays_at_baseline(self) -> None:
+        ev = _event(_dt(2026, 11, 7, 7, 0), _dt(2026, 11, 7, 10, 0), inventory=5)
+        self.assertIsNone(_qty(self.rules, ev))
+        self.assertFalse(_any_exception_ie_covers_event_start(self.rules, ev))
+
 
 class LeastStallsStartInWindowTests(unittest.TestCase):
     """5-stall and shorter cancelled 6-stall both cover Sep 25–26."""
